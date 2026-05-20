@@ -28,6 +28,13 @@ def generate_setup(
         return {
             "bias": "WAIT",
             "setup_status": "NO CHASE",
+            "execution_status": "TOO_LATE_DO_NOT_CHASE",
+            "execution_label": "🔴 ПОЕЗД УШЁЛ / НЕ ДОГОНЯТЬ",
+            "execution_short_label": "TOO LATE",
+            "current_price": _format_price(last_price),
+            "distance_to_entry_percent": None,
+            "distance_to_entry": "n/a",
+            "plan": "Цена уже ушла от зоны. Догонять нельзя.",
             "entry_zone": "No entry. Wait for structure reset.",
             "entry_distance": "n/a",
             "setup_entry_distance_percent": None,
@@ -261,6 +268,11 @@ def _long_setup(
     return _build_setup(
         bias=bias,
         status=status,
+        direction="LONG",
+        last_price=last_price,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        tp1_value=tp1,
         entry_zone=_format_zone(entry_low, entry_high),
         entry_distance=_format_entry_distance(_long_entry_distance_percent(last_price, entry_high), "below"),
         invalidation=f"below {_format_price(stop)}",
@@ -313,6 +325,11 @@ def _short_setup(
     return _build_setup(
         bias=bias,
         status=status,
+        direction="SHORT",
+        last_price=last_price,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        tp1_value=tp1,
         entry_zone=_format_zone(entry_low, entry_high),
         entry_distance=_format_entry_distance(_short_entry_distance_percent(last_price, entry_low), "above"),
         invalidation=f"above {_format_price(stop)}",
@@ -326,6 +343,11 @@ def _short_setup(
 def _build_setup(
     bias: str,
     status: str,
+    direction: str,
+    last_price: float,
+    entry_low: float,
+    entry_high: float,
+    tp1_value: float,
     entry_zone: str,
     entry_distance: str,
     invalidation: str,
@@ -335,9 +357,24 @@ def _build_setup(
     warning: str,
 ) -> dict[str, Any]:
     distance_percent = _extract_distance_percent(entry_distance)
+    execution = _classify_execution(
+        direction=direction,
+        status=status,
+        last_price=last_price,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        tp1_value=tp1_value,
+    )
     return {
         "bias": bias,
         "setup_status": status,
+        "execution_status": execution["execution_status"],
+        "execution_label": execution["execution_label"],
+        "execution_short_label": execution["execution_short_label"],
+        "current_price": _format_price(last_price),
+        "distance_to_entry_percent": execution["distance_to_entry_percent"],
+        "distance_to_entry": execution["distance_to_entry"],
+        "plan": _execution_plan(bias, status, execution["execution_status"]),
         "entry_zone": entry_zone,
         "entry_distance": entry_distance,
         "setup_entry_distance_percent": distance_percent,
@@ -361,6 +398,13 @@ def _no_setup(reason: str, warning: str = "Wait for better structure.") -> dict[
     return {
         "bias": "WAIT",
         "setup_status": "NO SETUP",
+        "execution_status": "NO_SETUP",
+        "execution_label": "⚪ НЕТ СЕТАПА",
+        "execution_short_label": "NO SETUP",
+        "current_price": "n/a",
+        "distance_to_entry_percent": None,
+        "distance_to_entry": "n/a",
+        "plan": "Нет торгового сценария. Ничего не делать.",
         "entry_zone": "n/a",
         "entry_distance": "n/a",
         "setup_entry_distance_percent": None,
@@ -463,6 +507,96 @@ def _atr_percent(last_price: float, atr: float) -> float:
     if last_price <= 0:
         return 0.0
     return (atr / last_price) * 100
+
+
+def _classify_execution(
+    direction: str,
+    status: str,
+    last_price: float,
+    entry_low: float,
+    entry_high: float,
+    tp1_value: float,
+) -> dict[str, Any]:
+    if entry_low <= last_price <= entry_high:
+        return _execution_result("ENTERABLE_NOW", 0.0)
+
+    if direction == "LONG":
+        distance = _long_entry_distance_percent(last_price, entry_high)
+        if _long_move_is_missed(last_price, tp1_value):
+            return _execution_result("TOO_LATE_DO_NOT_CHASE", distance)
+        if last_price > entry_high:
+            return _execution_result("PENDING_LIMIT_ONLY", distance)
+        return _execution_result("PENDING_LIMIT_ONLY", _long_entry_distance_percent(entry_low, last_price))
+
+    distance = _short_entry_distance_percent(last_price, entry_low)
+    if _short_move_is_missed(last_price, tp1_value):
+        return _execution_result("TOO_LATE_DO_NOT_CHASE", distance)
+    if last_price < entry_low:
+        return _execution_result("PENDING_LIMIT_ONLY", distance)
+    return _execution_result("PENDING_LIMIT_ONLY", _short_entry_distance_percent(entry_high, last_price))
+
+
+def _execution_result(status: str, distance_percent: float | None) -> dict[str, Any]:
+    labels = {
+        "ENTERABLE_NOW": ("🟢 МОЖНО СМОТРЕТЬ ВХОД СЕЙЧАС", "ENTERABLE"),
+        "PENDING_LIMIT_ONLY": ("🟡 ТОЛЬКО ЛИМИТКА В ЗОНЕ / НЕ ВХОДИТЬ ПО РЫНКУ", "LIMIT ONLY"),
+        "TOO_LATE_DO_NOT_CHASE": ("🔴 ПОЕЗД УШЁЛ / НЕ ДОГОНЯТЬ", "TOO LATE"),
+        "NO_SETUP": ("⚪ НЕТ СЕТАПА", "NO SETUP"),
+    }
+    label, short_label = labels.get(status, labels["NO_SETUP"])
+    return {
+        "execution_status": status,
+        "execution_label": label,
+        "execution_short_label": short_label,
+        "distance_to_entry_percent": distance_percent,
+        "distance_to_entry": "n/a" if distance_percent is None else f"{distance_percent:.2f}%",
+    }
+
+
+def _execution_plan(bias: str, status: str, execution_status: str) -> str:
+    if execution_status == "NO_SETUP":
+        return "Нет сетапа. Ничего не делать."
+    if execution_status == "TOO_LATE_DO_NOT_CHASE":
+        return "Цена уже ушла от зоны. Догонять нельзя."
+    if status in {"WAIT FOR PULLBACK", "WAIT FOR DEEP PULLBACK"}:
+        limit_plan = "Лимитный план: ждать цену в зоне входа."
+        if "LONG WATCH" in bias:
+            limit_plan = "Лимитный план: ждать цену в зоне входа. Не покупать после импульса."
+        elif "SHORT WATCH" in bias:
+            limit_plan = "Лимитный план: ждать цену в зоне входа. Не шортить после импульса."
+        return "\n".join(
+            [
+                "НЕ ВХОДИТЬ ПО РЫНКУ. Только ждать откат в зону или ставить лимитку.",
+                limit_plan,
+                "Ждать откат в Entry Zone.",
+                "Идея отменяется, если цена не даст откат или сломает структуру.",
+            ]
+        )
+    if "LONG WATCH" in bias:
+        return "Лимитный план: ждать цену в зоне входа. Не покупать после импульса."
+    if "SHORT WATCH" in bias:
+        return "Лимитный план: ждать цену в зоне входа. Не шортить после импульса."
+    if execution_status != "ENTERABLE_NOW":
+        return "Сценарий не в зоне входа. Не входить по рынку; ждать цену в Entry Zone."
+    return "Цена в зоне входа. Всё равно проверить график вручную и не считать это торговым сигналом."
+
+
+def _long_move_is_missed(last_price: float, tp1_value: float) -> bool:
+    if last_price <= 0:
+        return False
+    if last_price >= tp1_value:
+        return True
+    distance_to_tp1 = ((tp1_value - last_price) / last_price) * 100
+    return distance_to_tp1 <= config.MAX_CHASE_DISTANCE_PERCENT
+
+
+def _short_move_is_missed(last_price: float, tp1_value: float) -> bool:
+    if last_price <= 0:
+        return False
+    if last_price <= tp1_value:
+        return True
+    distance_to_tp1 = ((last_price - tp1_value) / last_price) * 100
+    return distance_to_tp1 <= config.MAX_CHASE_DISTANCE_PERCENT
 
 
 def _min_pullback_percent(

@@ -8,14 +8,14 @@ import config
 
 
 def build_main_keyboard() -> dict[str, Any]:
+    return build_main_menu_keyboard()
+
+
+def build_main_menu_keyboard() -> dict[str, Any]:
     return {
         "keyboard": [
-            ["📊 Status", "🔥 Top OI"],
-            ["🕘 Last Alerts", "⚙️ Config"],
-            ["⏸ Pause", "▶️ Resume"],
-            ["❓ Help"],
-            ["📒 Сетапы", "📘 Журнал"],
-            ["📈 Стата"],
+            ["📡 Радар", "📒 Сетапы"],
+            ["⚙️ Настройки", "❓ Help"],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -23,15 +23,102 @@ def build_main_keyboard() -> dict[str, Any]:
     }
 
 
-def build_bybit_chart_keyboard(symbol: str) -> dict[str, Any]:
+def build_radar_menu_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [
-                {
-                    "text": "Open Bybit Chart",
-                    "url": f"https://www.bybit.com/trade/usdt/{symbol}",
-                }
+                {"text": "📊 Status", "callback_data": "cmd:/status"},
+                {"text": "🔥 Top OI", "callback_data": "cmd:/top"},
+            ],
+            [
+                {"text": "🕘 Last Alerts", "callback_data": "cmd:/last"},
+                {"text": "🧪 Debug", "callback_data": "cmd:/debug_state"},
+            ],
+            [{"text": "⬅️ Назад", "callback_data": "menu:main"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_setups_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "📒 Активные сетапы", "callback_data": "cmd:/setups"}],
+            [{"text": "📘 Журнал", "callback_data": "cmd:/journal"}],
+            [{"text": "📈 Стата", "callback_data": "cmd:/stats"}],
+            [{"text": "📋 Ордера", "callback_data": "cmd:/orders"}],
+            [{"text": "📊 Позиции", "callback_data": "cmd:/positions"}],
+            [{"text": "💰 Баланс", "callback_data": "cmd:/balance"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:main"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_settings_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "⚙️ Config", "callback_data": "cmd:/config"}],
+            [
+                {"text": "⏸ Pause", "callback_data": "cmd:/pause"},
+                {"text": "▶️ Resume", "callback_data": "cmd:/resume"},
+            ],
+            [{"text": "💾 Backup DB", "callback_data": "cmd:/backup_db"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:main"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_main_inline_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📡 Радар", "callback_data": "menu:radar"},
+                {"text": "📒 Сетапы", "callback_data": "menu:setups"},
+            ],
+            [
+                {"text": "⚙️ Настройки", "callback_data": "menu:settings"},
+                {"text": "❓ Help", "callback_data": "cmd:/help"},
+            ],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_bybit_chart_keyboard(symbol: str) -> dict[str, Any]:
+    return build_alert_inline_keyboard(symbol)
+
+
+def build_alert_inline_keyboard(
+    symbol: str,
+    alert_id: str | None = None,
+    show_order_buttons: bool = False,
+) -> dict[str, Any]:
+    rows = [
+        [
+            {
+                "text": "Open Bybit Chart",
+                "url": f"https://www.bybit.com/trade/usdt/{symbol}",
+            }
+        ]
+    ]
+    if show_order_buttons and alert_id:
+        rows.extend(
+            [
+                [{"text": "🧮 Рассчитать ордер", "callback_data": f"order_calc:{alert_id}"}],
+                [{"text": "🚫 Пропустить", "callback_data": f"order_skip:{alert_id}"}],
             ]
+        )
+    return {"inline_keyboard": rows}
+
+
+def build_order_confirmation_keyboard(plan_id: str, trading_enabled: bool) -> dict[str, Any]:
+    submit_text = "✅ Поставить лимитку" if trading_enabled else "🧪 Paper order only"
+    return {
+        "inline_keyboard": [
+            [{"text": submit_text, "callback_data": f"order_submit:{plan_id}"}],
+            [{"text": "❌ Отмена", "callback_data": f"order_cancel:{plan_id}"}],
         ]
     }
 
@@ -144,6 +231,23 @@ class TelegramClient:
         )
         self.last_send_ts = time.time()
 
+    def edit_message_text(
+        self,
+        chat_id: Any,
+        message_id: Any,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        self._request("editMessageText", payload)
+
     def get_updates(
         self,
         offset: int | None = None,
@@ -151,7 +255,7 @@ class TelegramClient:
     ) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "timeout": timeout,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -165,6 +269,13 @@ class TelegramClient:
         if isinstance(result, list):
             return result
         return []
+
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+            payload["show_alert"] = False
+        self._request("answerCallbackQuery", payload)
 
     def is_authorized_chat(self, chat_id: Any) -> bool:
         return str(chat_id) == self.chat_id

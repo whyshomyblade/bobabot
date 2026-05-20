@@ -9,16 +9,22 @@ from indicators import analyze_indicator_context
 from setup_generator import generate_setup
 from setup_tracker import (
     create_active_setup_from_alert,
+    execution_quality_for_record,
+    execution_quality_label,
+    fee_adjusted_result_r_for_record,
+    fee_summary_for_record,
     format_tracking_event_message,
     normalize_final_state,
+    raw_result_r_for_record,
     result_for_record,
+    slippage_for_record,
     translate_bias,
     translate_direction,
     translate_setup_state,
     update_active_setups,
 )
 from storage import Storage
-from telegram_client import TelegramClient, build_bybit_chart_keyboard
+from telegram_client import TelegramClient, build_alert_inline_keyboard, build_bybit_chart_keyboard
 
 
 class MarketScanner:
@@ -146,12 +152,18 @@ class MarketScanner:
                 enriched_alert = self._attach_risk_classification(enriched_alert)
                 enriched_alert = self._attach_setup_scenario(enriched_alert)
                 enriched_alert["timestamp"] = timestamp.isoformat()
+                enriched_alert["alert_record_id"] = self._alert_record_id(enriched_alert)
+                self._attach_setup_ids(enriched_alert)
+                self._record_recent_alert(enriched_alert, timestamp)
                 self.telegram.send_message(
                     self._format_alert(enriched_alert),
-                    reply_markup=build_bybit_chart_keyboard(enriched_alert["symbol"]),
+                    reply_markup=build_alert_inline_keyboard(
+                        enriched_alert["symbol"],
+                        alert_id=enriched_alert["alert_record_id"],
+                        show_order_buttons=self._order_buttons_allowed(enriched_alert),
+                    ),
                 )
                 self._record_alert(enriched_alert["symbol"], timestamp)
-                self._record_recent_alert(enriched_alert, timestamp)
                 self._track_setup_if_actionable(enriched_alert)
                 sent += 1
             except Exception as exc:
@@ -241,13 +253,15 @@ class MarketScanner:
             risk_level = alert.get("risk_level") or "Unknown"
             setup_bias = alert.get("setup_bias") or "Unknown"
             setup_status = alert.get("setup_status") or "Unknown"
+            execution_status = self._alert_execution_status(alert)
+            execution_label = self._execution_status_label_ru(execution_status)
             lines.extend(
                 [
                     "",
                     (
                         f"{index}. {alert.get('symbol', 'n/a')} | "
                         f"{alert_type} | {risk_level} | "
-                        f"{setup_bias} / {setup_status}"
+                        f"{setup_bias} / {setup_status} | {execution_label}"
                     ),
                     (
                         f"Price: {self._format_signed_percent(price_change)} | "
@@ -275,6 +289,7 @@ class MarketScanner:
                         f"{translate_bias(setup.get('bias'))} | "
                         f"{translate_setup_state(state)}"
                     ),
+                    f"Execution: {setup.get('execution_short_label') or self._execution_short_label(setup.get('execution_status'))}",
                 ]
             )
             if state == "WAITING_ENTRY":
@@ -315,6 +330,9 @@ class MarketScanner:
         for index, record in enumerate(reversed(records), start=1):
             final_state = normalize_final_state(record)
             result = result_for_record(record)
+            raw_result_r = raw_result_r_for_record(record)
+            net_result_r = fee_adjusted_result_r_for_record(record)
+            execution_quality = execution_quality_for_record(record)
             lines.extend(
                 [
                     "",
@@ -325,8 +343,16 @@ class MarketScanner:
                     ),
                     f"Вход: {self._format_price_value(record.get('entry_price_virtual'))}",
                     f"Закрыт: {self._format_alert_time_short(record.get('closed_at'))}",
+                    f"Raw: {self._format_r_value(raw_result_r)}",
+                    f"Fee mode: {record.get('fee_mode') or config.DEFAULT_EXECUTION_FEE_MODE}",
+                    f"Fees: {fee_summary_for_record(record)}",
+                    f"Slippage: {slippage_for_record(record):.2f}%",
+                    f"Net estimate: {self._format_r_value(net_result_r)}",
+                    f"Execution: {execution_quality_label(execution_quality)}",
                 ]
             )
+            if execution_quality == "FAST_MOVE":
+                lines.append("⚠️ Быстрое движение: вход и TP произошли почти сразу. Руками можно было не успеть.")
         return "\n".join(lines)
 
     def format_setup_statistics(self) -> str:
@@ -338,6 +364,16 @@ class MarketScanner:
         invalidated_after_tp1 = stats.get("invalidated_after_tp1", 0)
         expired_no_entry = stats.get("expired_no_entry", 0)
         expired_after_entry = stats.get("expired_after_entry", 0)
+        realistic_tp1 = stats.get("realistic_tp1", 0)
+        fast_move_tp1 = stats.get("fast_move_tp1", 0)
+        realistic_tp2 = stats.get("realistic_tp2", 0)
+        fast_move_tp2 = stats.get("fast_move_tp2", 0)
+        raw_average_r = stats.get("raw_average_r", 0.0)
+        fee_adjusted_average_r = stats.get("fee_adjusted_average_r", 0.0)
+        enterable_now_count = stats.get("enterable_now_count", 0)
+        pending_limit_count = stats.get("pending_limit_count", 0)
+        too_late_count = stats.get("too_late_count", 0)
+        no_setup_count = stats.get("no_setup_count", 0)
         tp1_reached = tp1_only + tp2_hit
 
         lines = [
@@ -350,10 +386,22 @@ class MarketScanner:
             f"Сломано после TP1: {invalidated_after_tp1}",
             f"Истекло без входа: {expired_no_entry}",
             f"Истекло после входа: {expired_after_entry}",
+            f"Realistic TP1: {realistic_tp1}",
+            f"Fast-move TP1: {fast_move_tp1}",
+            f"Realistic TP2: {realistic_tp2}",
+            f"Fast-move TP2: {fast_move_tp2}",
+            f"Raw average R: {raw_average_r:+.2f}R",
+            f"Fee-adjusted average R: {fee_adjusted_average_r:+.2f}R",
             "",
             f"TP1 rate: {self._format_rate(tp1_reached, total)}",
             f"TP2 rate: {self._format_rate(tp2_hit, total)}",
             f"Invalidation before TP1 rate: {self._format_rate(invalidated_before_tp1, total)}",
+            "",
+            "По исполнению:",
+            f"Можно сейчас: {enterable_now_count}",
+            f"Только лимитка: {pending_limit_count}",
+            f"Поздно / не догонять: {too_late_count}",
+            f"Нет сетапа: {no_setup_count}",
             "",
             "По направлению:",
         ]
@@ -736,23 +784,74 @@ class MarketScanner:
         self.storage.state["alerts_today"]["count"] += 1
 
     def _record_recent_alert(self, alert: dict[str, Any], timestamp: datetime) -> None:
+        setup_scenario = alert.get("setup_scenario") or {}
+        execution_status = setup_scenario.get("execution_status") or "NO_SETUP"
+        if execution_status not in {
+            "ENTERABLE_NOW",
+            "PENDING_LIMIT_ONLY",
+            "TOO_LATE_DO_NOT_CHASE",
+            "NO_SETUP",
+        }:
+            execution_status = "NO_SETUP"
+
         record = {
+            "id": alert.get("alert_record_id") or self._alert_record_id(alert),
             "timestamp": timestamp.isoformat(),
             "symbol": alert["symbol"],
+            "price": alert.get("price"),
             "price_change_percent": alert["price_change_percent"],
             "oi_change_percent": alert["oi_change_percent"],
             "volume_spike": alert["volume_spike"],
             "alert_type": alert.get("alert_type", "Radar Activity"),
             "risk_level": alert.get("risk_level", "Unknown"),
-            "setup_bias": (alert.get("setup_scenario") or {}).get("bias", "Unknown"),
-            "setup_status": (alert.get("setup_scenario") or {}).get("setup_status", "Unknown"),
-            "entry_zone": (alert.get("setup_scenario") or {}).get("entry_zone", "n/a"),
-            "setup_entry_distance_percent": (alert.get("setup_scenario") or {}).get("setup_entry_distance_percent"),
-            "invalidation": (alert.get("setup_scenario") or {}).get("invalidation", "n/a"),
-            "tp1": (alert.get("setup_scenario") or {}).get("tp1", "n/a"),
-            "tp2": (alert.get("setup_scenario") or {}).get("tp2", "n/a"),
+            "setup_bias": setup_scenario.get("bias", "Unknown"),
+            "setup_status": setup_scenario.get("setup_status", "Unknown"),
+            "execution_status": execution_status,
+            "execution_short_label": setup_scenario.get("execution_short_label", "NO SETUP"),
+            "source_setup_id": setup_scenario.get("setup_id") or self._source_setup_id(alert),
+            "entry_zone": setup_scenario.get("entry_zone", "n/a"),
+            "setup_entry_distance_percent": setup_scenario.get("setup_entry_distance_percent"),
+            "invalidation": setup_scenario.get("invalidation", "n/a"),
+            "tp1": setup_scenario.get("tp1", "n/a"),
+            "tp2": setup_scenario.get("tp2", "n/a"),
         }
         self.storage.add_alert_record(record)
+
+    def _alert_record_id(self, alert: dict[str, Any]) -> str:
+        symbol = str(alert.get("symbol") or "UNKNOWN")
+        timestamp = str(alert.get("timestamp") or int(time.time()))
+        safe_timestamp = "".join(char if char.isalnum() else "_" for char in timestamp)
+        return f"setup_{symbol}_{safe_timestamp}"[:48]
+
+    def _source_setup_id(self, alert: dict[str, Any]) -> str:
+        symbol = str(alert.get("symbol") or "UNKNOWN")
+        timestamp = str(alert.get("timestamp") or int(time.time()))
+        safe_timestamp = "".join(char if char.isalnum() else "_" for char in timestamp)
+        return f"{symbol}-{safe_timestamp}"
+
+    def _attach_setup_ids(self, alert: dict[str, Any]) -> None:
+        setup = alert.get("setup_scenario")
+        if not isinstance(setup, dict):
+            return
+        setup.setdefault("setup_id", alert.get("alert_record_id") or self._alert_record_id(alert))
+
+    def _order_buttons_allowed(self, alert: dict[str, Any]) -> bool:
+        setup = alert.get("setup_scenario") or {}
+        if not isinstance(setup, dict):
+            return False
+        bias = str(setup.get("bias") or "")
+        has_direction = bias in {"LONG", "LONG WATCH", "SHORT", "SHORT WATCH"}
+        return (
+            has_direction
+            and alert.get("risk_level") != "EXTREME"
+            and setup.get("setup_status") not in {None, "NO SETUP", "NO CHASE"}
+            and setup.get("bias") != "WAIT"
+            and setup.get("execution_status") in {"ENTERABLE_NOW", "PENDING_LIMIT_ONLY"}
+            and setup.get("entry_zone") not in {None, "", "n/a"}
+            and setup.get("invalidation") not in {None, "", "n/a"}
+            and setup.get("tp1") not in {None, "", "n/a"}
+            and setup.get("tp2") not in {None, "", "n/a"}
+        )
 
     def _track_setup_if_actionable(self, alert: dict[str, Any]) -> None:
         if not config.ENABLE_SETUP_TRACKING:
@@ -760,6 +859,9 @@ class MarketScanner:
 
         setup_record = alert.get("setup_scenario")
         if not isinstance(setup_record, dict):
+            return
+        if setup_record.get("execution_status") == "TOO_LATE_DO_NOT_CHASE":
+            self.logger.info("Skipping too-late setup tracking: %s", alert.get("symbol"))
             return
 
         active_setup = create_active_setup_from_alert(alert, setup_record)
@@ -883,30 +985,43 @@ class MarketScanner:
 
         if setup_scenario:
             lines.extend(["", "Setup Scenario:"])
+            execution_label = setup_scenario.get("execution_label") or self._execution_label(
+                setup_scenario.get("execution_status")
+            )
+            plan = setup_scenario.get("plan") or "Проверить график вручную."
             if setup_scenario.get("setup_status") == "NO SETUP":
                 lines.extend(
                     [
                         f"Bias: {setup_scenario['bias']}",
                         f"Status: {setup_scenario['setup_status']}",
+                        f"Execution: {execution_label}",
                         f"Reason: {setup_scenario['reason']}",
                         f"Warning: {setup_scenario['warning']}",
+                        "",
+                        "Plan:",
                     ]
                 )
+                lines.extend(str(plan).splitlines())
             else:
                 lines.extend(
                     [
                         f"Bias: {setup_scenario['bias']}",
                         f"Status: {setup_scenario['setup_status']}",
+                        f"Execution: {execution_label}",
                         f"Entry Zone: {setup_scenario['entry_zone']}",
-                        f"Entry Distance: {setup_scenario['entry_distance']}",
+                        f"Current Price: {setup_scenario.get('current_price', 'n/a')}",
+                        f"Distance to Entry: {setup_scenario.get('distance_to_entry', setup_scenario.get('entry_distance', 'n/a'))}",
                         f"Invalidation: {setup_scenario['invalidation']}",
                         f"TP1: {setup_scenario['tp1']}",
                         f"TP2: {setup_scenario['tp2']}",
                         f"R/R: {setup_scenario['risk_reward']}",
                         f"Reason: {setup_scenario['reason']}",
                         f"Warning: {setup_scenario['warning']}",
+                        "",
+                        "Plan:",
                     ]
                 )
+                lines.extend(str(plan).splitlines())
 
         lines.extend(
             [
@@ -986,6 +1101,45 @@ class MarketScanner:
             return self._to_float(snapshot.get("turnover_24h"))
         return self._to_float(snapshot.get("volume_24h"))
 
+    def _execution_label(self, status: Any) -> str:
+        labels = {
+            "ENTERABLE_NOW": "🟢 МОЖНО СМОТРЕТЬ ВХОД СЕЙЧАС",
+            "PENDING_LIMIT_ONLY": "🟡 ТОЛЬКО ЛИМИТКА В ЗОНЕ / НЕ ВХОДИТЬ ПО РЫНКУ",
+            "TOO_LATE_DO_NOT_CHASE": "🔴 ПОЕЗД УШЁЛ / НЕ ДОГОНЯТЬ",
+            "NO_SETUP": "⚪ НЕТ СЕТАПА",
+        }
+        return labels.get(str(status or ""), labels["NO_SETUP"])
+
+    def _execution_short_label(self, status: Any) -> str:
+        labels = {
+            "ENTERABLE_NOW": "ENTERABLE",
+            "PENDING_LIMIT_ONLY": "LIMIT ONLY",
+            "TOO_LATE_DO_NOT_CHASE": "TOO LATE",
+            "NO_SETUP": "NO SETUP",
+        }
+        return labels.get(str(status or ""), "Unknown")
+
+    def _alert_execution_status(self, alert: dict[str, Any]) -> str:
+        status = alert.get("execution_status")
+        if status in {
+            "ENTERABLE_NOW",
+            "PENDING_LIMIT_ONLY",
+            "TOO_LATE_DO_NOT_CHASE",
+            "NO_SETUP",
+        }:
+            return status
+        return "legacy"
+
+    def _execution_status_label_ru(self, status: str) -> str:
+        labels = {
+            "ENTERABLE_NOW": "ВХОД СЕЙЧАС",
+            "PENDING_LIMIT_ONLY": "ТОЛЬКО ЛИМИТКА",
+            "TOO_LATE_DO_NOT_CHASE": "ПОЕЗД УШЁЛ",
+            "NO_SETUP": "НЕТ СЕТАПА",
+            "legacy": "старый алерт",
+        }
+        return labels.get(status, "старый алерт")
+
     def _format_setup_zone(self, setup: dict[str, Any]) -> str:
         return (
             f"{self._format_price_value(setup.get('entry_low'))} - "
@@ -1025,6 +1179,9 @@ class MarketScanner:
         if total <= 0:
             return "0%"
         return f"{(count / total) * 100:.0f}%"
+
+    def _format_r_value(self, value: float) -> str:
+        return f"{value:+.2f}R"
 
     def _format_stats_group(
         self,

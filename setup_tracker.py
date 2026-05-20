@@ -80,6 +80,49 @@ def result_for_record(record: dict[str, Any]) -> str:
     return _result_for_state(normalize_final_state(record))
 
 
+def raw_result_r_for_record(record: dict[str, Any]) -> float:
+    value = _to_float(record.get("raw_result_r"))
+    if value is not None:
+        return value
+    return _raw_result_r_for_state(normalize_final_state(record))
+
+
+def fee_adjusted_result_r_for_record(record: dict[str, Any]) -> float:
+    value = _to_float(record.get("fee_adjusted_result_r"))
+    if value is not None:
+        return value
+    return _calculate_fee_adjusted_result(record)
+
+
+def fee_summary_for_record(record: dict[str, Any]) -> str:
+    fee_mode = str(record.get("fee_mode") or config.DEFAULT_EXECUTION_FEE_MODE)
+    fee_rate = _fee_rate_for_mode(fee_mode)
+    return f"{fee_mode} {fee_rate * 100:.3f}% x2"
+
+
+def slippage_for_record(record: dict[str, Any]) -> float:
+    value = _to_float(record.get("slippage_percent"))
+    if value is not None:
+        return value
+    return config.SLIPPAGE_PERCENT
+
+
+def execution_quality_for_record(record: dict[str, Any]) -> str:
+    value = str(record.get("execution_quality") or "")
+    if value:
+        return value
+    return "UNKNOWN"
+
+
+def execution_quality_label(value: Any) -> str:
+    quality = str(value or "UNKNOWN")
+    if quality == "REALISTIC":
+        return "🟢 РЕАЛИСТИЧНО"
+    if quality in {"FAST_MOVE", "MAYBE_NOT_EXECUTABLE", "FAST_MOVE / MAYBE_NOT_EXECUTABLE"}:
+        return "⚠️ БЫСТРОЕ ДВИЖЕНИЕ / РУКАМИ МОЖНО БЫЛО НЕ УСПЕТЬ"
+    return "⚪ НЕИЗВЕСТНО"
+
+
 def parse_price_value(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
@@ -150,6 +193,10 @@ def create_active_setup_from_alert(
         "alert_type": alert_record.get("alert_type", "Unknown"),
         "risk_level": alert_record.get("risk_level", "Unknown"),
         "created_price": float(created_price),
+        "execution_status": setup_record.get("execution_status"),
+        "execution_short_label": setup_record.get("execution_short_label"),
+        "current_price_at_alert": parse_price_value(setup_record.get("current_price")),
+        "distance_to_entry_percent": _to_float(setup_record.get("distance_to_entry_percent")),
         "entry_low": float(entry_low),
         "entry_high": float(entry_high),
         "invalidation": float(invalidation),
@@ -159,6 +206,8 @@ def create_active_setup_from_alert(
         "state": "WAITING_ENTRY",
         "entered_at": None,
         "entry_price_virtual": None,
+        "entry_candle_ts": None,
+        "execution_quality": None,
         "tp1_hit_at": None,
         "tp2_hit_at": None,
         "invalidated_at": None,
@@ -270,15 +319,19 @@ def evaluate_setup_with_latest_market_data(
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     latest_low, latest_high = _latest_range(latest_price, latest_candle)
-    direction = setup.get("direction")
     state = setup.get("state") or "WAITING_ENTRY"
+    just_entered = False
+    latest_candle_ts = _candle_timestamp(latest_candle)
 
     if state == "WAITING_ENTRY" and _entry_touched(setup, latest_low, latest_high):
         entry_price = _entry_midpoint(setup)
         setup["state"] = "ENTERED"
         setup["entered_at"] = _iso_now()
         setup["entry_price_virtual"] = entry_price
+        setup["entry_candle_ts"] = latest_candle_ts
+        setup["execution_quality"] = _entry_execution_quality(setup)
         state = "ENTERED"
+        just_entered = True
         events.append(_event("ENTERED", setup))
         LOGGER.info("Setup entered: %s", setup.get("symbol"))
 
@@ -290,11 +343,14 @@ def evaluate_setup_with_latest_market_data(
     tp1_hit = _tp1_hit(setup, latest_low, latest_high)
     tp2_hit = _tp2_hit(setup, latest_low, latest_high)
     had_tp1 = setup_has_tp1(setup) or state == "TP1_HIT"
+    tp_fast_move = just_entered or _same_entry_candle(setup, latest_candle_ts)
 
     if invalidated and (tp1_hit or tp2_hit):
         if had_tp1:
             setup["state"] = "TP1_THEN_INVALIDATED"
             setup["invalidated_at"] = _iso_now()
+            if tp_fast_move:
+                setup["execution_quality"] = "FAST_MOVE"
             events.append(
                 _final_event(
                     "TP1_THEN_INVALIDATED",
@@ -329,12 +385,16 @@ def evaluate_setup_with_latest_market_data(
             setup["tp1_hit_at"] = _iso_now()
         setup["state"] = "TP2_HIT"
         setup["tp2_hit_at"] = _iso_now()
+        if tp_fast_move:
+            setup["execution_quality"] = "FAST_MOVE"
         events.append(_final_event("TP2_HIT", setup, "+2.5R scenario reached"))
         return events
 
     if tp1_hit and setup.get("tp1_hit_at") is None:
         setup["state"] = "TP1_HIT"
         setup["tp1_hit_at"] = _iso_now()
+        if tp_fast_move:
+            setup["execution_quality"] = "FAST_MOVE"
         events.append(_event("TP1_HIT", setup))
         LOGGER.info("TP1 hit: %s", setup.get("symbol"))
 
@@ -353,7 +413,7 @@ def move_setup_to_journal(
     record["final_state"] = final_state
     record["closed_at"] = _iso_now()
     record["close_reason"] = reason
-    record["result_r"] = result_for_record(record)
+    _attach_result_metrics(record)
     return record
 
 
@@ -373,6 +433,7 @@ def format_tracking_event_message(event: dict[str, Any]) -> str:
                 f"TP1: {_format_price(setup.get('tp1'))}",
                 f"TP2: {_format_price(setup.get('tp2'))}",
                 "",
+                f"Execution: {execution_quality_label(setup.get('execution_quality'))}",
                 "Это виртуальное отслеживание, не реальная сделка.",
             ]
         )
@@ -386,8 +447,9 @@ def format_tracking_event_message(event: dict[str, Any]) -> str:
                 f"Направление: {translate_direction(setup.get('direction'))}",
                 f"Виртуальный вход: {_format_price(setup.get('entry_price_virtual'))}",
                 f"TP1: {_format_price(setup.get('tp1'))}",
+                f"Execution: {execution_quality_label(setup.get('execution_quality'))}",
                 "Результат: сценарий дошёл до +1.5R",
-            ]
+            ] + _execution_warning_lines(setup)
         )
 
     if event_type == "TP2_HIT":
@@ -399,8 +461,9 @@ def format_tracking_event_message(event: dict[str, Any]) -> str:
                 f"Направление: {translate_direction(setup.get('direction'))}",
                 f"Виртуальный вход: {_format_price(setup.get('entry_price_virtual'))}",
                 f"TP2: {_format_price(setup.get('tp2'))}",
+                f"Execution: {execution_quality_label(setup.get('execution_quality'))}",
                 "Результат: +2.5R",
-            ]
+            ] + _execution_warning_lines(setup)
         )
 
     if event_type == "TP1_THEN_INVALIDATED":
@@ -413,8 +476,9 @@ def format_tracking_event_message(event: dict[str, Any]) -> str:
                 f"Виртуальный вход: {_format_price(setup.get('entry_price_virtual'))}",
                 f"TP1: {_format_price(setup.get('tp1'))}",
                 f"Инвалидация: {_format_price(setup.get('invalidation'))}",
+                f"Execution: {execution_quality_label(setup.get('execution_quality'))}",
                 "Результат: частичная отработка / TP1 only",
-            ]
+            ] + _execution_warning_lines(setup)
         )
 
     if event_type in {
@@ -430,6 +494,7 @@ def format_tracking_event_message(event: dict[str, Any]) -> str:
             f"Направление: {translate_direction(setup.get('direction'))}",
             f"Виртуальный вход: {_format_price(setup.get('entry_price_virtual'))}",
             f"Инвалидация: {_format_price(setup.get('invalidation'))}",
+            f"Execution: {execution_quality_label(setup.get('execution_quality'))}",
             "Результат: сценарий провален / -1R",
         ]
         if event_type in {"AMBIGUOUS_INVALIDATION_FIRST", "INVALIDATED_FIRST_UNKNOWN"}:
@@ -444,6 +509,7 @@ def format_tracking_event_message(event: dict[str, Any]) -> str:
                 f"Монета: {setup.get('symbol', 'n/a')}",
                 f"Состояние: {translate_setup_state(event_type)}",
                 f"Причина: сценарий истёк через {config.SETUP_TRACKING_EXPIRATION_HOURS:g} часов",
+                f"Execution: {execution_quality_label(setup.get('execution_quality'))}",
             ]
         )
 
@@ -453,6 +519,7 @@ def format_tracking_event_message(event: dict[str, Any]) -> str:
 def _is_actionable_setup(setup_record: dict[str, Any]) -> bool:
     return (
         setup_record.get("setup_status") != "NO SETUP"
+        and setup_record.get("execution_status") != "TOO_LATE_DO_NOT_CHASE"
         and setup_record.get("bias") != "WAIT"
         and setup_record.get("entry_zone") not in (None, "", "n/a")
         and setup_record.get("invalidation") not in (None, "", "n/a")
@@ -507,6 +574,31 @@ def _latest_range(
     if low is None or high is None:
         return latest_price, latest_price
     return low, high
+
+
+def _candle_timestamp(latest_candle: dict[str, float] | None) -> float | None:
+    if not latest_candle:
+        return None
+    return _to_float(latest_candle.get("timestamp"))
+
+
+def _entry_execution_quality(setup: dict[str, Any]) -> str:
+    created_at = _parse_iso(setup.get("created_at"))
+    entered_at = _parse_iso(setup.get("entered_at"))
+    if created_at is None or entered_at is None:
+        return "UNKNOWN"
+
+    elapsed = (entered_at - created_at).total_seconds()
+    if elapsed >= config.MIN_SECONDS_AFTER_ALERT_FOR_ENTRY:
+        return "REALISTIC"
+    return "FAST_MOVE"
+
+
+def _same_entry_candle(setup: dict[str, Any], latest_candle_ts: float | None) -> bool:
+    entry_candle_ts = _to_float(setup.get("entry_candle_ts"))
+    if entry_candle_ts is None or latest_candle_ts is None:
+        return False
+    return entry_candle_ts == latest_candle_ts
 
 
 def _entry_touched(setup: dict[str, Any], latest_low: float, latest_high: float) -> bool:
@@ -664,6 +756,86 @@ def _result_for_state(final_state: str) -> str:
     }:
         return "-1R"
     return "0R"
+
+
+def _raw_result_r_for_state(final_state: str) -> float:
+    if final_state == "TP2_HIT":
+        return config.SETUP_TP2_R_MULTIPLIER
+    if final_state in {"TP1_THEN_INVALIDATED", "TP1_HIT"}:
+        return config.SETUP_TP1_R_MULTIPLIER
+    if final_state in {
+        "INVALIDATED",
+        "INVALIDATED_BEFORE_TP1",
+        "AMBIGUOUS_INVALIDATION_FIRST",
+        "INVALIDATED_FIRST_UNKNOWN",
+    }:
+        return -1.0
+    return 0.0
+
+
+def _attach_result_metrics(record: dict[str, Any]) -> None:
+    raw_result_r = _raw_result_r_for_state(normalize_final_state(record))
+    fee_mode = str(record.get("fee_mode") or config.DEFAULT_EXECUTION_FEE_MODE)
+    fee_rate = _fee_rate_for_mode(fee_mode)
+    round_trip_fee_percent = fee_rate * 100 * 2
+
+    record["result_r"] = result_for_record(record)
+    record["raw_result_r"] = raw_result_r
+    record["fee_mode"] = fee_mode
+    record["fee_rate"] = fee_rate
+    record["round_trip_fee_percent"] = round_trip_fee_percent
+    record["slippage_percent"] = config.SLIPPAGE_PERCENT
+    record["fee_adjusted_result_r"] = _calculate_fee_adjusted_result(record)
+
+
+def _calculate_fee_adjusted_result(record: dict[str, Any]) -> float:
+    raw_result_r = _to_float(record.get("raw_result_r"))
+    if raw_result_r is None:
+        raw_result_r = _raw_result_r_for_state(normalize_final_state(record))
+
+    if normalize_final_state(record) in {"EXPIRED_NO_ENTRY", "EXPIRED_AFTER_ENTRY"}:
+        return raw_result_r
+
+    risk_percent = _risk_percent(record)
+    if risk_percent is None or risk_percent <= 0:
+        return raw_result_r
+
+    fee_mode = str(record.get("fee_mode") or config.DEFAULT_EXECUTION_FEE_MODE)
+    fee_rate = _to_float(record.get("fee_rate"))
+    if fee_rate is None:
+        fee_rate = _fee_rate_for_mode(fee_mode)
+
+    round_trip_fee_percent = _to_float(record.get("round_trip_fee_percent"))
+    if round_trip_fee_percent is None:
+        round_trip_fee_percent = fee_rate * 100 * 2
+
+    slippage_percent = slippage_for_record(record)
+    cost_r = (round_trip_fee_percent + slippage_percent) / risk_percent
+    return raw_result_r - cost_r
+
+
+def _risk_percent(record: dict[str, Any]) -> float | None:
+    entry = _to_float(record.get("entry_price_virtual"))
+    if entry is None:
+        entry = _entry_midpoint(record)
+    invalidation = _to_float(record.get("invalidation"))
+    if entry is None or invalidation is None or entry <= 0:
+        return None
+    return abs(entry - invalidation) / entry * 100
+
+
+def _fee_rate_for_mode(fee_mode: str) -> float:
+    if fee_mode == "maker":
+        return config.BYBIT_MAKER_FEE_RATE
+    return config.BYBIT_TAKER_FEE_RATE
+
+
+def _execution_warning_lines(record: dict[str, Any]) -> list[str]:
+    if execution_quality_for_record(record) != "FAST_MOVE":
+        return []
+    return [
+        "⚠️ Быстрое движение: вход и TP произошли почти сразу. Руками можно было не успеть."
+    ]
 
 
 def _format_zone(setup: dict[str, Any]) -> str:

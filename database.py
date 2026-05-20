@@ -62,6 +62,21 @@ class BotDatabase:
                 )
                 """
             )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_orders (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT,
+                    side TEXT,
+                    status TEXT,
+                    source_setup_id TEXT,
+                    mode TEXT,
+                    data TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -230,6 +245,92 @@ class BotDatabase:
 
     def count_setup_journal(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM setup_journal").fetchone()[0])
+
+    def add_paper_order(self, record: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(record.get("id") or self._record_id("paper_order", record))
+        now = self._now()
+        record["id"] = record_id
+        record.setdefault("created_at", now)
+        record["updated_at"] = now
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO paper_orders
+                    (id, symbol, side, status, source_setup_id, mode, data, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    record.get("symbol"),
+                    record.get("side"),
+                    record.get("status"),
+                    record.get("source_setup_id"),
+                    record.get("mode"),
+                    self._dumps(record),
+                    record.get("created_at"),
+                    record.get("updated_at"),
+                ),
+            )
+        return record
+
+    def update_paper_order(self, order_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        record = self.get_paper_order(order_id)
+        if record is None:
+            return None
+        record.update(updates)
+        record["updated_at"] = self._now()
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE paper_orders
+                SET symbol = ?, side = ?, status = ?, source_setup_id = ?, mode = ?, data = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    record.get("symbol"),
+                    record.get("side"),
+                    record.get("status"),
+                    record.get("source_setup_id"),
+                    record.get("mode"),
+                    self._dumps(record),
+                    record.get("updated_at"),
+                    order_id,
+                ),
+            )
+        return record
+
+    def get_paper_order(self, order_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT data FROM paper_orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        record = self._loads(row["data"], {})
+        return record if isinstance(record, dict) else None
+
+    def get_paper_orders(
+        self,
+        statuses: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT data FROM paper_orders"
+        params: list[Any] = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            query += f" WHERE status IN ({placeholders})"
+            params.extend(statuses)
+        query += " ORDER BY rowid DESC"
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        rows = self.connection.execute(query, tuple(params)).fetchall()
+        records = [self._loads(row["data"], {}) for row in rows]
+        return [record for record in records if isinstance(record, dict)]
+
+    def count_paper_orders(self) -> int:
+        return int(self.connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0])
 
     def migrate_from_state_json(self, state_path: str | Path) -> None:
         if self.get_runtime_state("sqlite_migration_completed", False):

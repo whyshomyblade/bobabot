@@ -2,27 +2,47 @@ import asyncio
 import logging
 import signal
 import time
+import uuid
 from typing import Any
 
 import config
 from bybit_client import BybitClient
+from bybit_private_client import BybitPrivateClient
 from health_server import start_health_server
+from risk_manager import build_order_plan_from_alert, format_order_plan
 from scanner import MarketScanner
 from storage import Storage
-from telegram_client import TelegramClient, build_main_keyboard
+from telegram_client import (
+    TelegramClient,
+    build_main_inline_menu_keyboard,
+    build_main_menu_keyboard,
+    build_order_confirmation_keyboard,
+    build_radar_menu_keyboard,
+    build_settings_menu_keyboard,
+    build_setups_menu_keyboard,
+)
 
 
 BUTTON_COMMANDS = {
+    "📡 Радар": "__radar_menu__",
+    "⚙️ Настройки": "__settings_menu__",
+    "⬅️ Главное меню": "__main_menu__",
     "📊 Status": "/status",
     "🔥 Top OI": "/top",
     "🕘 Last Alerts": "/last",
+    "🧪 Debug": "/debug_state",
     "⚙️ Config": "/config",
     "⏸ Pause": "/pause",
     "▶️ Resume": "/resume",
+    "💾 Backup DB": "/backup_db",
     "❓ Help": "/help",
-    "📒 Сетапы": "/setups",
+    "📒 Сетапы": "__setups_menu__",
+    "📒 Активные сетапы": "/setups",
     "📘 Журнал": "/journal",
     "📈 Стата": "/stats",
+    "📋 Ордера": "/orders",
+    "📊 Позиции": "/positions",
+    "💰 Баланс": "/balance",
     "📒 Setups": "/setups",
     "📘 Journal": "/journal",
     "📈 Stats": "/stats",
@@ -63,6 +83,7 @@ def debug_state_text(storage: Storage) -> str:
             f"Активных сетапов: {storage.database.count_active_setups()}",
             f"Записей журнала: {storage.database.count_setup_journal()}",
             f"История алертов: {storage.database.count_alert_history()}",
+            f"Paper/orders records: {storage.database.count_paper_orders()}",
             f"Последний скан: {storage.state.get('last_scan_time') or 'never'}",
             f"Hosting mode: {'ON' if config.HOSTING_MODE else 'OFF'}",
         ]
@@ -127,6 +148,21 @@ def config_text() -> str:
             f"• Макс активных сетапов: {config.SETUP_TRACKING_MAX_ACTIVE}",
             f"• Режим касания: {touch_mode_text}",
             f"• Макс записей журнала: {config.SETUP_JOURNAL_MAX_RECORDS}",
+            f"• Fee mode: {config.DEFAULT_EXECUTION_FEE_MODE}",
+            f"• Taker fee: {config.BYBIT_TAKER_FEE_RATE * 100:.3f}%",
+            f"• Maker fee: {config.BYBIT_MAKER_FEE_RATE * 100:.3f}%",
+            f"• Slippage: {config.SLIPPAGE_PERCENT:g}%",
+            f"• Мин. задержка входа: {config.MIN_SECONDS_AFTER_ALERT_FOR_ENTRY} сек",
+            "",
+            "Execution Assistant:",
+            f"• Trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+            f"• Testnet: {str(config.BYBIT_TESTNET).lower()}",
+            f"• Account risk: {config.ACCOUNT_RISK_PERCENT:g}%",
+            f"• Max position: {config.MAX_POSITION_USDT:g} USDT",
+            f"• Max leverage: {config.MAX_LEVERAGE}x",
+            f"• Default leverage: {config.DEFAULT_LEVERAGE}x",
+            f"• Min R/R: {config.MIN_RR_TO_ALLOW_ORDER:g}",
+            f"• Allow high risk orders: {str(config.ALLOW_HIGH_RISK_ORDERS).lower()}",
         ]
     )
 
@@ -149,16 +185,10 @@ def help_text() -> str:
             "Он только показывает аномалии, которые надо проверять вручную на графике.",
             "",
             "Кнопки:",
-            "📊 Status — статус бота",
-            "🔥 Top OI — топ монет по росту Open Interest за 15 минут",
-            "🕘 Last Alerts — последние алерты",
-            "⚙️ Config — текущие настройки",
-            "⏸ Pause — остановить мониторинг",
-            "▶️ Resume — возобновить мониторинг",
+            "📡 Радар — статус, топ OI, последние алерты, debug",
+            "📒 Сетапы — активные сетапы, журнал, статистика, ордера, позиции, баланс",
+            "⚙️ Настройки — config, pause/resume, backup DB",
             "❓ Help — помощь",
-            "📒 Сетапы — активные сценарии, за которыми бот следит",
-            "📘 Журнал — закрытые сценарии",
-            "📈 Стата — статистика отработки сетапов",
             "",
             "Как читать алерт:",
             "• OI растёт + цена растёт — в рынок заходят новые позиции по движению",
@@ -174,12 +204,21 @@ def help_text() -> str:
             "Не входи по алерту вслепую. Сначала открой график.",
             "",
             "Бот отслеживает виртуальные сценарии. Это не реальные сделки и не торговый сигнал.",
+            "",
+            "Execution Assistant:",
+            "Бот может рассчитать лимитный план, но НЕ отправляет ордер автоматически.",
+            "Любой ордер требует явного подтверждения Telegram-кнопкой.",
+            "По умолчанию включён paper mode: реальные ордера на Bybit не отправляются.",
         ]
     )
 
 
-def send_with_keyboard(telegram: TelegramClient, text: str) -> None:
-    telegram.send_message(text, reply_markup=build_main_keyboard())
+def send_with_keyboard(
+    telegram: TelegramClient,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+) -> None:
+    telegram.send_message(text, reply_markup=reply_markup or build_main_menu_keyboard())
 
 
 def handle_update(
@@ -187,7 +226,12 @@ def handle_update(
     storage: Storage,
     telegram: TelegramClient,
     scanner: MarketScanner,
+    private_client: BybitPrivateClient,
 ) -> None:
+    if update.get("callback_query"):
+        handle_callback_query(update["callback_query"], storage, telegram, scanner, private_client)
+        return
+
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
@@ -202,50 +246,433 @@ def handle_update(
     elif text.startswith("/"):
         command = text.split()[0].split("@")[0].lower()
     else:
+        send_with_keyboard(
+            telegram,
+            "Не понял команду. Выбери действие из меню.",
+            build_main_menu_keyboard(),
+        )
         return
 
-    if command == "/start":
-        send_with_keyboard(telegram, "Bybit futures radar bot is alive.")
+    dispatch_command(command, storage, telegram, scanner, private_client)
+
+
+def dispatch_command(
+    command: str,
+    storage: Storage,
+    telegram: TelegramClient,
+    scanner: MarketScanner,
+    private_client: BybitPrivateClient,
+) -> None:
+    if command == "__main_menu__":
+        send_with_keyboard(telegram, "Главное меню", build_main_inline_menu_keyboard())
+    elif command == "__radar_menu__":
+        send_with_keyboard(telegram, "📡 Радар", build_radar_menu_keyboard())
+    elif command == "__setups_menu__":
+        send_with_keyboard(telegram, "📒 Сетапы", build_setups_menu_keyboard())
+    elif command == "__settings_menu__":
+        send_with_keyboard(telegram, "⚙️ Настройки", build_settings_menu_keyboard())
+    elif command == "/start":
+        send_with_keyboard(telegram, "Bybit futures radar bot is alive.", build_main_menu_keyboard())
     elif command == "/help":
-        send_with_keyboard(telegram, help_text())
+        send_with_keyboard(telegram, help_text(), build_main_menu_keyboard())
     elif command == "/status":
-        send_with_keyboard(telegram, status_text(storage))
+        send_with_keyboard(telegram, status_text(storage), build_radar_menu_keyboard())
     elif command == "/config":
-        send_with_keyboard(telegram, config_text())
+        send_with_keyboard(telegram, config_text(), build_settings_menu_keyboard())
     elif command == "/last":
-        send_with_keyboard(telegram, scanner.format_last_alerts(limit=10))
+        send_with_keyboard(telegram, scanner.format_last_alerts(limit=10), build_radar_menu_keyboard())
     elif command == "/setups":
-        send_with_keyboard(telegram, scanner.format_active_setups())
+        send_with_keyboard(telegram, scanner.format_active_setups(), build_setups_menu_keyboard())
     elif command == "/journal":
-        send_with_keyboard(telegram, scanner.format_setup_journal(limit=10))
+        send_with_keyboard(telegram, scanner.format_setup_journal(limit=10), build_setups_menu_keyboard())
     elif command in {"/statistics", "/stats"}:
-        send_with_keyboard(telegram, scanner.format_setup_statistics())
+        send_with_keyboard(telegram, scanner.format_setup_statistics(), build_setups_menu_keyboard())
     elif command == "/debug_state":
-        send_with_keyboard(telegram, debug_state_text(storage))
+        send_with_keyboard(telegram, debug_state_text(storage), build_radar_menu_keyboard())
     elif command == "/backup_db":
         backup_path = storage.backup_database()
-        send_with_keyboard(telegram, f"✅ Бэкап базы создан: {backup_path}")
+        send_with_keyboard(telegram, f"✅ Бэкап базы создан: {backup_path}", build_settings_menu_keyboard())
+    elif command == "/orders":
+        send_with_keyboard(telegram, orders_text(storage, private_client), build_setups_menu_keyboard())
+    elif command == "/positions":
+        send_with_keyboard(telegram, positions_text(private_client), build_setups_menu_keyboard())
+    elif command == "/balance":
+        send_with_keyboard(telegram, balance_text(private_client), build_setups_menu_keyboard())
     elif command == "/pause":
         storage.state["monitoring_enabled"] = False
         storage.save()
-        send_with_keyboard(telegram, "Monitoring paused.")
+        send_with_keyboard(telegram, "Monitoring paused.", build_settings_menu_keyboard())
     elif command == "/resume":
         storage.state["monitoring_enabled"] = True
         storage.save()
-        send_with_keyboard(telegram, "Monitoring resumed.")
+        send_with_keyboard(telegram, "Monitoring resumed.", build_settings_menu_keyboard())
     elif command == "/top":
-        send_with_keyboard(telegram, scanner.format_top_oi_growth())
+        send_with_keyboard(telegram, scanner.format_top_oi_growth(), build_radar_menu_keyboard())
     else:
         send_with_keyboard(
             telegram,
-            "Unknown command. Use /status, /config, /last, /setups, /journal, /stats, /pause, /resume, /top, /help.",
+            "Не понял команду. Выбери действие из меню.",
+            build_main_menu_keyboard(),
         )
+
+
+def handle_callback_query(
+    callback_query: dict[str, Any],
+    storage: Storage,
+    telegram: TelegramClient,
+    scanner: MarketScanner,
+    private_client: BybitPrivateClient,
+) -> None:
+    callback_id = str(callback_query.get("id") or "")
+    message = callback_query.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if not telegram.is_authorized_chat(chat_id):
+        logging.getLogger("CommandHandler").warning("Ignoring callback from unauthorized chat_id=%s", chat_id)
+        return
+
+    data = str(callback_query.get("data") or "")
+    if callback_id:
+        telegram.answer_callback_query(callback_id)
+
+    if data == "menu:main":
+        edit_menu_message(telegram, message, "Главное меню", build_main_inline_menu_keyboard())
+    elif data == "menu:radar":
+        edit_menu_message(telegram, message, "📡 Радар", build_radar_menu_keyboard())
+    elif data == "menu:setups":
+        edit_menu_message(telegram, message, "📒 Сетапы", build_setups_menu_keyboard())
+    elif data == "menu:settings":
+        edit_menu_message(telegram, message, "⚙️ Настройки", build_settings_menu_keyboard())
+    elif data == "menu:close":
+        edit_menu_message(telegram, message, "Меню закрыто.", None)
+    elif data.startswith("cmd:"):
+        command = data.split(":", 1)[1]
+        dispatch_command(command, storage, telegram, scanner, private_client)
+    elif data.startswith("order_calc:"):
+        alert_id = data.split(":", 1)[1]
+        calculate_order_plan(alert_id, storage, telegram, private_client)
+    elif data.startswith("order_submit:"):
+        plan_id = data.split(":", 1)[1]
+        submit_order_plan(plan_id, storage, telegram, private_client)
+    elif data.startswith("order_cancel:"):
+        plan_id = data.split(":", 1)[1]
+        storage.update_paper_order(plan_id, {"status": "CANCELLED"})
+        send_with_keyboard(telegram, "❌ План ордера отменён.", build_main_menu_keyboard())
+    elif data.startswith("order_skip:"):
+        send_with_keyboard(telegram, "🚫 Сетап пропущен.", build_main_menu_keyboard())
+    else:
+        send_with_keyboard(telegram, "Не понял действие. Выбери действие из меню.", build_main_menu_keyboard())
+
+
+def edit_menu_message(
+    telegram: TelegramClient,
+    message: dict[str, Any],
+    text: str,
+    reply_markup: dict[str, Any] | None,
+) -> None:
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    if chat_id is None or message_id is None:
+        telegram.send_message(text, reply_markup=reply_markup or build_main_menu_keyboard())
+        return
+    try:
+        telegram.edit_message_text(chat_id, message_id, text, reply_markup=reply_markup)
+    except Exception as exc:
+        logging.getLogger("CommandHandler").warning("Could not edit menu message: %s", exc)
+        telegram.send_message(text, reply_markup=reply_markup or build_main_menu_keyboard())
+
+
+def calculate_order_plan(
+    alert_id: str,
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("ExecutionAssistant")
+    if config.BYBIT_TRADING_ENABLED and not private_client.has_api_keys:
+        send_with_keyboard(telegram, "Bybit API keys не настроены.", build_main_menu_keyboard())
+        return
+
+    alert = storage.get_alert_record(alert_id)
+    if alert is None:
+        send_with_keyboard(telegram, "❌ Ордер отклонён\nПричина: алерт не найден или это старый алерт.")
+        return
+
+    symbol = str(alert.get("symbol") or "")
+    try:
+        instrument_info = private_client.get_instrument_info(symbol)
+    except Exception as exc:
+        logger.error("Order plan rejected: instrument info failed symbol=%s error=%s", symbol, exc)
+        send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: instrument info unavailable ({exc})")
+        return
+
+    try:
+        account_balance = account_balance_for_planning(private_client)
+    except Exception as exc:
+        logger.error("Order plan rejected: balance check failed symbol=%s error=%s", symbol, exc)
+        send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: не удалось получить баланс ({exc})")
+        return
+    has_paper_order = has_active_paper_order(storage, symbol)
+    has_real_order = False
+    has_real_position = False
+    if private_client.can_call_private:
+        try:
+            has_real_order = bool(private_client.get_open_orders(symbol))
+            has_real_position = has_active_position(private_client.get_positions(symbol))
+        except Exception as exc:
+            logger.warning("Could not check real orders/positions for %s: %s", symbol, exc)
+
+    plan = build_order_plan_from_alert(
+        alert=alert,
+        instrument_info=instrument_info,
+        account_balance_usdt=account_balance,
+        leverage=config.DEFAULT_LEVERAGE,
+        has_existing_order=has_paper_order or has_real_order,
+        has_existing_position=has_real_position,
+    )
+    logger.info(
+        "Order decision: %s symbol=%s side=%s setup_id=%s execution_status=%s risk=%s reason=%s",
+        "allowed" if plan.get("allowed") else "rejected",
+        symbol,
+        plan.get("side"),
+        plan.get("source_setup_id"),
+        plan.get("execution_status"),
+        plan.get("risk_level"),
+        ", ".join(plan.get("reasons") or []),
+    )
+
+    if not plan.get("allowed"):
+        send_with_keyboard(telegram, format_order_plan(plan), build_main_menu_keyboard())
+        return
+
+    plan_id = f"ord_{uuid.uuid4().hex[:18]}"
+    plan["id"] = plan_id
+    plan["status"] = "PLANNED"
+    storage.add_paper_order(plan)
+    telegram.send_message(
+        format_order_plan(plan),
+        reply_markup=build_order_confirmation_keyboard(plan_id, private_client.can_trade_real),
+    )
+
+
+def submit_order_plan(
+    plan_id: str,
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("ExecutionAssistant")
+    plan = storage.get_paper_order(plan_id)
+    if plan is None:
+        send_with_keyboard(telegram, "❌ План ордера не найден.", build_main_menu_keyboard())
+        return
+    if plan.get("status") != "PLANNED":
+        send_with_keyboard(telegram, f"❌ План уже имеет статус: {plan.get('status')}", build_main_menu_keyboard())
+        return
+
+    if config.BYBIT_TRADING_ENABLED and not private_client.has_api_keys:
+        send_with_keyboard(telegram, "Bybit API keys не настроены.", build_main_menu_keyboard())
+        return
+
+    if not private_client.can_trade_real:
+        updated = storage.update_paper_order(plan_id, {"status": "SUBMITTED", "mode": "PAPER"})
+        logger.info(
+            "Paper order submitted symbol=%s side=%s setup_id=%s execution_status=%s risk=%s",
+            plan.get("symbol"),
+            plan.get("side"),
+            plan.get("source_setup_id"),
+            plan.get("execution_status"),
+            plan.get("risk_level"),
+        )
+        send_with_keyboard(
+            telegram,
+            "\n".join(
+                [
+                    "🧪 Paper order created. Реальный ордер не отправлен.",
+                    "Paper mode: ордер НЕ отправлен на Bybit",
+                    f"Монета: {(updated or plan).get('symbol')}",
+                    f"Направление: {(updated or plan).get('side')}",
+                    f"Entry limit: {(updated or plan).get('entry_price')}",
+                ]
+            ),
+            build_main_menu_keyboard(),
+        )
+        return
+
+    try:
+        response = private_client.place_limit_order(
+            symbol=str(plan.get("symbol")),
+            side=str(plan.get("bybit_side")),
+            qty=str(plan.get("qty")),
+            price=str(plan.get("entry_price")),
+            reduce_only=False,
+        )
+        result = response.get("result") or {}
+        storage.update_paper_order(
+            plan_id,
+            {
+                "status": "SUBMITTED",
+                "mode": private_client.mode_label(),
+                "exchange_order_id": result.get("orderId"),
+                "exchange_response": response,
+            },
+        )
+        logger.info(
+            "Real/testnet limit order submitted symbol=%s side=%s order_id=%s",
+            plan.get("symbol"),
+            plan.get("side"),
+            result.get("orderId"),
+        )
+        send_with_keyboard(
+            telegram,
+            "\n".join(
+                [
+                    "✅ Лимитный ордер отправлен.",
+                    f"Режим: {private_client.mode_label()}",
+                    f"Монета: {plan.get('symbol')}",
+                    f"Order ID: {result.get('orderId', 'n/a')}",
+                ]
+            ),
+            build_main_menu_keyboard(),
+        )
+    except Exception as exc:
+        logger.error("Order submit failed symbol=%s error=%s", plan.get("symbol"), exc)
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": str(exc)})
+        send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {exc}", build_main_menu_keyboard())
+
+
+def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    lines = ["📋 Ордера:"]
+    paper_orders = storage.get_paper_orders(statuses=["PLANNED", "SUBMITTED"], limit=10)
+    if paper_orders:
+        lines.append("")
+        lines.append("Активные paper/assistant ордера:")
+        for order in paper_orders:
+            lines.append(
+                (
+                    f"- {order.get('symbol')} | {_direction_ru(order.get('side'))} | {_order_status_ru(order.get('status'))} | "
+                    f"{order.get('mode')} | Entry {order.get('entry_price')} | Qty {order.get('qty')}"
+                )
+            )
+    else:
+        lines.append("- активных paper orders нет")
+
+    if private_client.can_call_private:
+        try:
+            open_orders = private_client.get_open_orders()
+            lines.append("")
+            lines.append("Открытые ордера Bybit:")
+            if open_orders:
+                for order in open_orders[:10]:
+                    lines.append(
+                        (
+                            f"- {order.get('symbol')} | {order.get('side')} | "
+                            f"{order.get('orderStatus')} | {order.get('qty')} @ {order.get('price')}"
+                        )
+                    )
+            else:
+                lines.append("- открытых ордеров нет")
+        except Exception as exc:
+            lines.append(f"Открытые ордера Bybit: ошибка API ({exc})")
+    else:
+        lines.append("")
+        lines.append("Ордера Bybit: API trading disabled")
+    return "\n".join(lines)
+
+
+def positions_text(private_client: BybitPrivateClient) -> str:
+    if not private_client.can_call_private:
+        return "📊 Позиции:\nAPI trading disabled"
+    try:
+        positions = [
+            item
+            for item in private_client.get_positions()
+            if abs(_to_float(item.get("size")) or 0) > 0
+        ]
+    except Exception as exc:
+        return f"📊 Позиции:\nОшибка API: {exc}"
+    if not positions:
+        return "📊 Позиции:\nОткрытых позиций нет."
+    lines = ["📊 Позиции:"]
+    for item in positions[:10]:
+        lines.append(
+            (
+                f"- {item.get('symbol')} | {item.get('side')} | "
+                f"Размер: {item.get('size')} | Вход: {item.get('avgPrice')} | PnL: {item.get('unrealisedPnl')}"
+            )
+        )
+    return "\n".join(lines)
+
+
+def balance_text(private_client: BybitPrivateClient) -> str:
+    if not private_client.can_call_private:
+        return "💰 Баланс:\nAPI trading disabled"
+    try:
+        balance = private_client.get_account_balance()
+        usdt = extract_usdt_balance(balance)
+    except Exception as exc:
+        return f"💰 Баланс:\nОшибка API: {exc}"
+    return f"💰 Баланс:\nUSDT: {usdt:.2f}"
+
+
+def account_balance_for_planning(private_client: BybitPrivateClient) -> float:
+    if not private_client.can_call_private:
+        return config.PAPER_ACCOUNT_BALANCE_USDT
+    return extract_usdt_balance(private_client.get_account_balance())
+
+
+def extract_usdt_balance(payload: dict[str, Any]) -> float:
+    accounts = payload.get("result", {}).get("list", [])
+    if not isinstance(accounts, list):
+        return 0.0
+    for account in accounts:
+        coins = account.get("coin", [])
+        if not isinstance(coins, list):
+            continue
+        for coin in coins:
+            if coin.get("coin") == "USDT":
+                return _to_float(coin.get("equity") or coin.get("walletBalance")) or 0.0
+    return 0.0
+
+
+def has_active_paper_order(storage: Storage, symbol: str) -> bool:
+    for order in storage.get_paper_orders(statuses=["PLANNED", "SUBMITTED"]):
+        if order.get("symbol") == symbol:
+            return True
+    return False
+
+
+def has_active_position(positions: list[dict[str, Any]]) -> bool:
+    return any(abs(_to_float(item.get("size")) or 0) > 0 for item in positions)
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _direction_ru(value: Any) -> str:
+    return {"LONG": "ЛОНГ", "SHORT": "ШОРТ"}.get(str(value or ""), str(value or "n/a"))
+
+
+def _order_status_ru(value: Any) -> str:
+    labels = {
+        "PLANNED": "ЗАПЛАНИРОВАН",
+        "SUBMITTED": "ОТПРАВЛЕН",
+        "FILLED": "ИСПОЛНЕН",
+        "CANCELLED": "ОТМЕНЁН",
+        "REJECTED": "ОТКЛОНЁН",
+    }
+    return labels.get(str(value or ""), str(value or "n/a"))
 
 
 def poll_telegram_commands(
     storage: Storage,
     telegram: TelegramClient,
     scanner: MarketScanner,
+    private_client: BybitPrivateClient,
 ) -> None:
     logger = logging.getLogger("TelegramPoller")
     offset = storage.state.get("telegram_update_offset")
@@ -268,7 +695,7 @@ def poll_telegram_commands(
                 storage.state["telegram_update_offset"] = next_offset
 
         try:
-            handle_update(update, storage, telegram, scanner)
+            handle_update(update, storage, telegram, scanner, private_client)
         except Exception as exc:
             logger.error("Failed to handle Telegram update: %s", exc)
 
@@ -283,6 +710,7 @@ async def main_async() -> None:
 
     storage = Storage()
     bybit = BybitClient()
+    private_client = BybitPrivateClient()
     telegram = TelegramClient(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
     scanner = MarketScanner(bybit, storage, telegram)
 
@@ -334,7 +762,7 @@ async def main_async() -> None:
                 run_scan_job()
                 next_scan_ts = time.monotonic() + config.SCAN_INTERVAL_SECONDS
 
-            poll_telegram_commands(storage, telegram, scanner)
+            poll_telegram_commands(storage, telegram, scanner, private_client)
             await asyncio.sleep(1)
     finally:
         if health_server is not None:

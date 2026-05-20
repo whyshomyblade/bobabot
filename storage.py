@@ -7,7 +7,12 @@ from typing import Any
 
 import config
 from database import BotDatabase
-from setup_tracker import normalize_final_state
+from setup_tracker import (
+    execution_quality_for_record,
+    fee_adjusted_result_r_for_record,
+    normalize_final_state,
+    raw_result_r_for_record,
+)
 
 
 def utc_now() -> datetime:
@@ -52,6 +57,7 @@ class Storage:
             "telegram_update_offset": None,
             "active_setups": [],
             "setup_journal": [],
+            "paper_orders": [],
             "last_setup_tracking_ts": 0,
         }
 
@@ -66,6 +72,7 @@ class Storage:
         state["recent_alerts"] = self.database.get_alert_history(limit=config.RECENT_ALERTS_LIMIT)
         state["active_setups"] = self.database.get_active_setups()
         state["setup_journal"] = self.database.get_setup_journal(limit=config.SETUP_JOURNAL_MAX_RECORDS)
+        state["paper_orders"] = self.database.get_paper_orders(statuses=["PLANNED", "SUBMITTED", "FILLED"])
         return state
 
     def save(self) -> None:
@@ -81,6 +88,7 @@ class Storage:
             "active_setups",
             "setup_journal",
             "alert_history",
+            "paper_orders",
         }
         for key, value in self.state.items():
             if key not in runtime_skip:
@@ -102,6 +110,12 @@ class Storage:
 
     def get_alert_history(self, limit: int | None = None) -> list[dict[str, Any]]:
         return self.database.get_alert_history(limit=limit)
+
+    def get_alert_record(self, alert_id: str) -> dict[str, Any] | None:
+        for record in self.database.get_alert_history(limit=None):
+            if record.get("id") == alert_id:
+                return record
+        return None
 
     def add_alert_record(self, record: dict[str, Any]) -> None:
         recent_alerts = self.state.setdefault("recent_alerts", [])
@@ -176,6 +190,26 @@ class Storage:
     def get_setup_journal(self, limit: int | None = None) -> list[dict[str, Any]]:
         return self.database.get_setup_journal(limit=limit)
 
+    def add_paper_order(self, record: dict[str, Any]) -> dict[str, Any]:
+        saved = self.database.add_paper_order(record)
+        self.state["paper_orders"] = self.database.get_paper_orders(statuses=["PLANNED", "SUBMITTED", "FILLED"])
+        return saved
+
+    def update_paper_order(self, order_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        updated = self.database.update_paper_order(order_id, updates)
+        self.state["paper_orders"] = self.database.get_paper_orders(statuses=["PLANNED", "SUBMITTED", "FILLED"])
+        return updated
+
+    def get_paper_order(self, order_id: str) -> dict[str, Any] | None:
+        return self.database.get_paper_order(order_id)
+
+    def get_paper_orders(
+        self,
+        statuses: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.database.get_paper_orders(statuses=statuses, limit=limit)
+
     def save_runtime_state(self, key: str, value: Any) -> None:
         self.state[key] = value
         self.database.save_runtime_state(key, value)
@@ -196,19 +230,42 @@ class Storage:
             "invalidated_after_tp1": 0,
             "expired_no_entry": 0,
             "expired_after_entry": 0,
+            "realistic_tp1": 0,
+            "fast_move_tp1": 0,
+            "realistic_tp2": 0,
+            "fast_move_tp2": 0,
+            "enterable_now_count": 0,
+            "pending_limit_count": 0,
+            "too_late_count": 0,
+            "no_setup_count": 0,
+            "raw_average_r": 0.0,
+            "fee_adjusted_average_r": 0.0,
             "by_direction": {},
             "by_alert_type": {},
         }
+        raw_sum = 0.0
+        net_sum = 0.0
 
         for record in records:
             final_state = normalize_final_state(record)
             direction = record.get("direction") or "Unknown"
             alert_type = record.get("alert_type") or "Unknown"
+            execution_quality = execution_quality_for_record(record)
+            raw_sum += raw_result_r_for_record(record)
+            net_sum += fee_adjusted_result_r_for_record(record)
 
             if final_state in {"TP1_THEN_INVALIDATED", "TP1_HIT"}:
                 stats["tp1_only"] += 1
+                if execution_quality == "FAST_MOVE":
+                    stats["fast_move_tp1"] += 1
+                elif execution_quality == "REALISTIC":
+                    stats["realistic_tp1"] += 1
             if final_state == "TP2_HIT":
                 stats["tp2_hit"] += 1
+                if execution_quality == "FAST_MOVE":
+                    stats["fast_move_tp2"] += 1
+                elif execution_quality == "REALISTIC":
+                    stats["realistic_tp2"] += 1
             if final_state in {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST"}:
                 stats["invalidated_before_tp1"] += 1
             if final_state == "TP1_THEN_INVALIDATED":
@@ -220,6 +277,21 @@ class Storage:
 
             self._increment_group_stats(stats["by_direction"], direction, final_state)
             self._increment_group_stats(stats["by_alert_type"], alert_type, final_state)
+
+        if total > 0:
+            stats["raw_average_r"] = raw_sum / total
+            stats["fee_adjusted_average_r"] = net_sum / total
+
+        for alert in self.get_alert_history(limit=None):
+            execution_status = self._alert_execution_status(alert)
+            if execution_status == "ENTERABLE_NOW":
+                stats["enterable_now_count"] += 1
+            elif execution_status == "PENDING_LIMIT_ONLY":
+                stats["pending_limit_count"] += 1
+            elif execution_status == "TOO_LATE_DO_NOT_CHASE":
+                stats["too_late_count"] += 1
+            elif execution_status == "NO_SETUP":
+                stats["no_setup_count"] += 1
 
         return stats
 
@@ -247,6 +319,8 @@ class Storage:
             self.state["active_setups"] = []
         if not isinstance(self.state.get("setup_journal"), list):
             self.state["setup_journal"] = []
+        if not isinstance(self.state.get("paper_orders"), list):
+            self.state["paper_orders"] = []
 
         self.reset_alert_counter_if_needed()
 
@@ -278,3 +352,29 @@ class Storage:
             group["invalidated_before_tp1"] += 1
         elif final_state in {"EXPIRED_NO_ENTRY", "EXPIRED_AFTER_ENTRY"}:
             group["expired"] += 1
+
+    def _alert_execution_status(self, alert: dict[str, Any]) -> str | None:
+        status = alert.get("execution_status")
+        if status in {
+            "ENTERABLE_NOW",
+            "PENDING_LIMIT_ONLY",
+            "TOO_LATE_DO_NOT_CHASE",
+            "NO_SETUP",
+        }:
+            return status
+
+        short_label = str(alert.get("execution_short_label") or "").upper()
+        if short_label in {"ENTERABLE", "ENTERABLE NOW"}:
+            return "ENTERABLE_NOW"
+        if short_label in {"LIMIT ONLY", "PENDING LIMIT ONLY"}:
+            return "PENDING_LIMIT_ONLY"
+        if short_label in {"TOO LATE", "DO NOT CHASE"}:
+            return "TOO_LATE_DO_NOT_CHASE"
+        if short_label == "NO SETUP":
+            return "NO_SETUP"
+
+        setup_status = str(alert.get("setup_status") or "").upper()
+        setup_bias = str(alert.get("setup_bias") or "").upper()
+        if setup_status == "NO SETUP" or setup_bias == "WAIT":
+            return "NO_SETUP"
+        return None
