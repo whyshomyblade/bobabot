@@ -7,3 +7,8 @@ state.json
 state.backup.json
 *.backup.json
 backup_*.db
+*.db
+*_export_*.csv
+*_export_*.json
+__pycache__/
+*.pyc
