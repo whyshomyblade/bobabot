@@ -37,6 +37,7 @@ class Storage:
         self.database = BotDatabase(database_path)
         self.logger = logging.getLogger(self.__class__.__name__)
         self.database.migrate_from_state_json(self.path)
+        self.database.backup_before_phase7()
         self.state = self.load()
         self._normalize()
         self.save()
@@ -58,6 +59,8 @@ class Storage:
             "active_setups": [],
             "setup_journal": [],
             "paper_orders": [],
+            "symbol_blacklist": list(config.SYMBOL_BLACKLIST),
+            "last_daily_report_date": None,
             "last_setup_tracking_ts": 0,
         }
 
@@ -321,6 +324,8 @@ class Storage:
             self.state["setup_journal"] = []
         if not isinstance(self.state.get("paper_orders"), list):
             self.state["paper_orders"] = []
+        if not isinstance(self.state.get("symbol_blacklist"), list):
+            self.state["symbol_blacklist"] = list(config.SYMBOL_BLACKLIST)
 
         self.reset_alert_counter_if_needed()
 

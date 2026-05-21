@@ -1,14 +1,30 @@
 import asyncio
+import csv
+import json
 import logging
 import signal
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import config
 from bybit_client import BybitClient
 from bybit_private_client import BybitPrivateClient
 from health_server import start_health_server
+from performance_analyzer import (
+    JOURNAL_EXPORT_FIELDS,
+    ORDERS_EXPORT_FIELDS,
+    STATS_EXPORT_FIELDS,
+    analyze_performance,
+    format_analytics,
+    format_daily_report,
+    format_recommendations,
+    journal_export_rows,
+    orders_export_rows,
+    stats_export_rows,
+)
 from risk_manager import build_order_plan_from_alert, format_order_plan
 from scanner import MarketScanner
 from storage import Storage
@@ -40,9 +56,15 @@ BUTTON_COMMANDS = {
     "📒 Активные сетапы": "/setups",
     "📘 Журнал": "/journal",
     "📈 Стата": "/stats",
+    "🧠 Аналитика": "/analytics",
+    "📊 Daily Report Now": "/daily_report_now",
+    "🧪 Рекомендации": "/recommend_filters",
     "📋 Ордера": "/orders",
     "📊 Позиции": "/positions",
     "💰 Баланс": "/balance",
+    "📤 Экспорт журнала": "/export_journal",
+    "📤 Экспорт статистики": "/export_stats",
+    "📤 Экспорт ордеров": "/export_orders",
     "📒 Setups": "/setups",
     "📘 Journal": "/journal",
     "📈 Stats": "/stats",
@@ -163,6 +185,11 @@ def config_text() -> str:
             f"• Default leverage: {config.DEFAULT_LEVERAGE}x",
             f"• Min R/R: {config.MIN_RR_TO_ALLOW_ORDER:g}",
             f"• Allow high risk orders: {str(config.ALLOW_HIGH_RISK_ORDERS).lower()}",
+            "",
+            "Analytics:",
+            f"• Daily report: {'ON' if config.DAILY_REPORT_ENABLED else 'OFF'}",
+            f"• Daily report hour UTC: {config.DAILY_REPORT_HOUR_UTC}",
+            f"• Symbol blacklist: {len(config.SYMBOL_BLACKLIST)} default symbols",
         ]
     )
 
@@ -186,7 +213,7 @@ def help_text() -> str:
             "",
             "Кнопки:",
             "📡 Радар — статус, топ OI, последние алерты, debug",
-            "📒 Сетапы — активные сетапы, журнал, статистика, ордера, позиции, баланс",
+            "📒 Сетапы — сетапы, журнал, статистика, аналитика, экспорт, ордера",
             "⚙️ Настройки — config, pause/resume, backup DB",
             "❓ Help — помощь",
             "",
@@ -241,10 +268,13 @@ def handle_update(
         return
 
     text = (message.get("text") or "").strip()
+    args: list[str] = []
     if text in BUTTON_COMMANDS:
         command = BUTTON_COMMANDS[text]
     elif text.startswith("/"):
-        command = text.split()[0].split("@")[0].lower()
+        parts = text.split()
+        command = parts[0].split("@")[0].lower()
+        args = parts[1:]
     else:
         send_with_keyboard(
             telegram,
@@ -253,7 +283,7 @@ def handle_update(
         )
         return
 
-    dispatch_command(command, storage, telegram, scanner, private_client)
+    dispatch_command(command, storage, telegram, scanner, private_client, args=args)
 
 
 def dispatch_command(
@@ -262,7 +292,9 @@ def dispatch_command(
     telegram: TelegramClient,
     scanner: MarketScanner,
     private_client: BybitPrivateClient,
+    args: list[str] | None = None,
 ) -> None:
+    args = args or []
     if command == "__main_menu__":
         send_with_keyboard(telegram, "Главное меню", build_main_inline_menu_keyboard())
     elif command == "__radar_menu__":
@@ -287,6 +319,24 @@ def dispatch_command(
         send_with_keyboard(telegram, scanner.format_setup_journal(limit=10), build_setups_menu_keyboard())
     elif command in {"/statistics", "/stats"}:
         send_with_keyboard(telegram, scanner.format_setup_statistics(), build_setups_menu_keyboard())
+    elif command == "/analytics":
+        send_analytics(storage, telegram)
+    elif command == "/daily_report_now":
+        send_daily_report_now(storage, telegram)
+    elif command == "/recommend_filters":
+        send_recommendations(storage, telegram)
+    elif command == "/export_journal":
+        export_journal(storage, telegram)
+    elif command == "/export_stats":
+        export_stats(storage, telegram)
+    elif command == "/export_orders":
+        export_orders(storage, telegram)
+    elif command == "/blacklist":
+        send_with_keyboard(telegram, blacklist_text(storage), build_setups_menu_keyboard())
+    elif command == "/blacklist_add":
+        send_with_keyboard(telegram, blacklist_add(storage, args), build_setups_menu_keyboard())
+    elif command == "/blacklist_remove":
+        send_with_keyboard(telegram, blacklist_remove(storage, args), build_setups_menu_keyboard())
     elif command == "/debug_state":
         send_with_keyboard(telegram, debug_state_text(storage), build_radar_menu_keyboard())
     elif command == "/backup_db":
@@ -541,6 +591,141 @@ def submit_order_plan(
         send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {exc}", build_main_menu_keyboard())
 
 
+def send_analytics(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        analysis = build_analysis(storage)
+        send_with_keyboard(telegram, format_analytics(analysis), build_setups_menu_keyboard())
+    except Exception as exc:
+        logging.getLogger("Analytics").error("Analytics failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка аналитики, сканер продолжает работать.", build_setups_menu_keyboard())
+
+
+def send_recommendations(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        analysis = build_analysis(storage)
+        send_with_keyboard(telegram, format_recommendations(analysis), build_setups_menu_keyboard())
+    except Exception as exc:
+        logging.getLogger("Analytics").error("Recommendations failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка аналитики, сканер продолжает работать.", build_setups_menu_keyboard())
+
+
+def send_daily_report_now(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        report = build_daily_report(storage)
+        send_with_keyboard(telegram, report, build_setups_menu_keyboard())
+    except Exception as exc:
+        logging.getLogger("Analytics").error("Daily report failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка аналитики, сканер продолжает работать.", build_setups_menu_keyboard())
+
+
+def build_analysis(storage: Storage, since: datetime | None = None) -> dict[str, Any]:
+    return analyze_performance(
+        storage.get_setup_journal(limit=None),
+        active_setups=storage.get_active_setups(),
+        alert_records=storage.get_alert_history(limit=None),
+        since=since,
+    )
+
+
+def build_daily_report(storage: Storage) -> str:
+    since = datetime.now(UTC) - timedelta(hours=24)
+    analysis = build_analysis(storage, since=since)
+    return format_daily_report(analysis, since)
+
+
+def maybe_send_daily_report(storage: Storage, telegram: TelegramClient) -> None:
+    if not config.DAILY_REPORT_ENABLED:
+        return
+    now = datetime.now(UTC)
+    if now.hour < config.DAILY_REPORT_HOUR_UTC:
+        return
+    today = now.date().isoformat()
+    if storage.state.get("last_daily_report_date") == today:
+        return
+    try:
+        telegram.send_message(build_daily_report(storage), chat_id=config.DAILY_REPORT_CHAT_ID)
+        storage.state["last_daily_report_date"] = today
+        storage.save_runtime_state("last_daily_report_date", today)
+    except Exception as exc:
+        logging.getLogger("Analytics").error("Daily report send failed: %s", exc)
+
+
+def export_journal(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        rows = journal_export_rows(storage.get_setup_journal(limit=None))
+        send_export_files(telegram, "journal_export", rows, JOURNAL_EXPORT_FIELDS)
+    except Exception as exc:
+        logging.getLogger("Analytics").error("Journal export failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка аналитики, сканер продолжает работать.", build_setups_menu_keyboard())
+
+
+def export_stats(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        rows = stats_export_rows(build_analysis(storage))
+        send_export_files(telegram, "stats_export", rows, STATS_EXPORT_FIELDS)
+    except Exception as exc:
+        logging.getLogger("Analytics").error("Stats export failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка аналитики, сканер продолжает работать.", build_setups_menu_keyboard())
+
+
+def export_orders(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        rows = orders_export_rows(storage.get_paper_orders(limit=None))
+        send_export_files(telegram, "orders_export", rows, ORDERS_EXPORT_FIELDS)
+    except Exception as exc:
+        logging.getLogger("Analytics").error("Orders export failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка аналитики, сканер продолжает работать.", build_setups_menu_keyboard())
+
+
+def send_export_files(
+    telegram: TelegramClient,
+    prefix: str,
+    rows: list[dict[str, Any]],
+    fields: list[str],
+) -> None:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    csv_path = Path(f"{prefix}_{timestamp}.csv")
+    json_path = Path(f"{prefix}_{timestamp}.json")
+    with csv_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    with json_path.open("w", encoding="utf-8") as file:
+        json.dump(rows, file, ensure_ascii=False, indent=2)
+    telegram.send_document(csv_path, caption=f"{prefix} CSV")
+    telegram.send_document(json_path, caption=f"{prefix} JSON")
+    send_with_keyboard(telegram, f"✅ Экспорт готов: {csv_path.name}, {json_path.name}", build_setups_menu_keyboard())
+
+
+def blacklist_text(storage: Storage) -> str:
+    symbols = sorted({str(item).upper() for item in storage.state.get("symbol_blacklist", [])})
+    if not symbols:
+        return "⚫ Blacklist пуст."
+    return "⚫ Blacklist:\n" + "\n".join(f"- {symbol}" for symbol in symbols)
+
+
+def blacklist_add(storage: Storage, args: list[str]) -> str:
+    if not args:
+        return "Использование: /blacklist_add SYMBOL"
+    symbol = args[0].upper()
+    symbols = {str(item).upper() for item in storage.state.get("symbol_blacklist", [])}
+    symbols.add(symbol)
+    storage.state["symbol_blacklist"] = sorted(symbols)
+    storage.save_runtime_state("symbol_blacklist", storage.state["symbol_blacklist"])
+    return f"⚫ {symbol} добавлен в blacklist."
+
+
+def blacklist_remove(storage: Storage, args: list[str]) -> str:
+    if not args:
+        return "Использование: /blacklist_remove SYMBOL"
+    symbol = args[0].upper()
+    symbols = {str(item).upper() for item in storage.state.get("symbol_blacklist", [])}
+    symbols.discard(symbol)
+    storage.state["symbol_blacklist"] = sorted(symbols)
+    storage.save_runtime_state("symbol_blacklist", storage.state["symbol_blacklist"])
+    return f"⚫ {symbol} удалён из blacklist."
+
+
 def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     lines = ["📋 Ордера:"]
     paper_orders = storage.get_paper_orders(statuses=["PLANNED", "SUBMITTED"], limit=10)
@@ -760,6 +945,7 @@ async def main_async() -> None:
         while not stop_event.is_set():
             if time.monotonic() >= next_scan_ts:
                 run_scan_job()
+                maybe_send_daily_report(storage, telegram)
                 next_scan_ts = time.monotonic() + config.SCAN_INTERVAL_SECONDS
 
             poll_telegram_commands(storage, telegram, scanner, private_client)

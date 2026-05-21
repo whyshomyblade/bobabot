@@ -23,6 +23,13 @@ def _env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None:
         return default
+
+
+def _env_list(name: str, default: list[str] | None = None) -> list[str]:
+    value = os.getenv(name)
+    if value is None:
+        return list(default or [])
+    return [item.strip().upper() for item in value.split(",") if item.strip()]
     try:
         return float(value.strip())
     except ValueError:
@@ -111,6 +118,11 @@ DEFAULT_LEVERAGE = _env_int("DEFAULT_LEVERAGE", 3)
 MIN_RR_TO_ALLOW_ORDER = _env_float("MIN_RR_TO_ALLOW_ORDER", 1.5)
 ALLOW_HIGH_RISK_ORDERS = _env_bool("ALLOW_HIGH_RISK_ORDERS", False)
 PAPER_ACCOUNT_BALANCE_USDT = _env_float("PAPER_ACCOUNT_BALANCE_USDT", 100.0)
+
+DAILY_REPORT_ENABLED = _env_bool("DAILY_REPORT_ENABLED", True)
+DAILY_REPORT_HOUR_UTC = _env_int("DAILY_REPORT_HOUR_UTC", 21)
+DAILY_REPORT_CHAT_ID = os.getenv("DAILY_REPORT_CHAT_ID", TELEGRAM_CHAT_ID).strip()
+SYMBOL_BLACKLIST = _env_list("SYMBOL_BLACKLIST", [])
 
 LOOKBACK_MINUTES = 15
 SYMBOL_REFRESH_INTERVAL_MINUTES = 30

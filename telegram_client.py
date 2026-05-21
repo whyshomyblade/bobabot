@@ -1,5 +1,6 @@
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -46,9 +47,15 @@ def build_setups_menu_keyboard() -> dict[str, Any]:
             [{"text": "📒 Активные сетапы", "callback_data": "cmd:/setups"}],
             [{"text": "📘 Журнал", "callback_data": "cmd:/journal"}],
             [{"text": "📈 Стата", "callback_data": "cmd:/stats"}],
+            [{"text": "🧠 Аналитика", "callback_data": "cmd:/analytics"}],
+            [{"text": "📊 Daily Report Now", "callback_data": "cmd:/daily_report_now"}],
+            [{"text": "🧪 Рекомендации", "callback_data": "cmd:/recommend_filters"}],
             [{"text": "📋 Ордера", "callback_data": "cmd:/orders"}],
             [{"text": "📊 Позиции", "callback_data": "cmd:/positions"}],
             [{"text": "💰 Баланс", "callback_data": "cmd:/balance"}],
+            [{"text": "📤 Экспорт журнала", "callback_data": "cmd:/export_journal"}],
+            [{"text": "📤 Экспорт статистики", "callback_data": "cmd:/export_stats"}],
+            [{"text": "📤 Экспорт ордеров", "callback_data": "cmd:/export_orders"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:main"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
@@ -211,6 +218,7 @@ class TelegramClient:
         self,
         text: str,
         reply_markup: dict[str, Any] | None = None,
+        chat_id: Any | None = None,
     ) -> None:
         now = time.time()
         elapsed = now - self.last_send_ts
@@ -218,7 +226,7 @@ class TelegramClient:
             time.sleep(config.TELEGRAM_MIN_SECONDS_BETWEEN_MESSAGES - elapsed)
 
         payload: dict[str, Any] = {
-            "chat_id": self.chat_id,
+            "chat_id": self.chat_id if chat_id is None else str(chat_id),
             "text": text,
             "disable_web_page_preview": True,
         }
@@ -230,6 +238,39 @@ class TelegramClient:
             payload,
         )
         self.last_send_ts = time.time()
+
+    def send_document(
+        self,
+        path: str | Path,
+        caption: str | None = None,
+    ) -> None:
+        file_path = Path(path)
+        url = f"{self.base_url}/sendDocument"
+        payload = {"chat_id": self.chat_id}
+        if caption:
+            payload["caption"] = caption
+
+        last_error: Exception | None = None
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            try:
+                with file_path.open("rb") as file_obj:
+                    response = self.session.post(
+                        url,
+                        data=payload,
+                        files={"document": (file_path.name, file_obj)},
+                        timeout=config.REQUEST_TIMEOUT_SECONDS,
+                    )
+                response.raise_for_status()
+                data = response.json()
+                if not data.get("ok"):
+                    raise TelegramAPIError(data.get("description", "unknown error"))
+                return
+            except (OSError, requests.RequestException, ValueError, TelegramAPIError) as exc:
+                last_error = exc
+                if attempt >= config.MAX_RETRIES:
+                    break
+                time.sleep(config.RETRY_BACKOFF_SECONDS * attempt)
+        raise TelegramAPIError(f"Telegram sendDocument failed after retries: {last_error}")
 
     def edit_message_text(
         self,

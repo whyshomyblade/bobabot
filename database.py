@@ -332,6 +332,20 @@ class BotDatabase:
     def count_paper_orders(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0])
 
+    def backup_before_phase7(self) -> Path | None:
+        if self.get_runtime_state("phase7_backup_completed", False):
+            return None
+        if not self.path.exists():
+            self.save_runtime_state("phase7_backup_completed", True)
+            return None
+
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        backup_path = self.path.with_name(f"backup_before_phase7_{timestamp}.db")
+        shutil.copy2(self.path, backup_path)
+        self.save_runtime_state("phase7_backup_completed", True)
+        self.logger.info("Created Phase 7 DB backup: %s", backup_path)
+        return backup_path
+
     def migrate_from_state_json(self, state_path: str | Path) -> None:
         if self.get_runtime_state("sqlite_migration_completed", False):
             return

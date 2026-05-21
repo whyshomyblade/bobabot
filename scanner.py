@@ -584,6 +584,14 @@ class MarketScanner:
                 candles=alert.get("_indicator_candles"),
             )
             alert["setup_scenario"] = setup
+            if self._is_symbol_blacklisted(alert["symbol"]):
+                setup["blacklisted"] = True
+                setup["bias"] = "WAIT"
+                setup["setup_status"] = "NO SETUP"
+                setup["execution_status"] = "NO_SETUP"
+                setup["execution_label"] = "⚫ Symbol blacklisted — setup ignored"
+                setup["reason"] = "Symbol blacklisted — setup ignored"
+                setup["warning"] = "Tradeable setup/order plan disabled for this symbol."
         except Exception as exc:
             self.logger.warning("Setup generation failed for %s: %s", alert.get("symbol"), exc)
             alert["setup_scenario"] = None
@@ -844,6 +852,7 @@ class MarketScanner:
         return (
             has_direction
             and alert.get("risk_level") != "EXTREME"
+            and not self._is_symbol_blacklisted(alert.get("symbol"))
             and setup.get("setup_status") not in {None, "NO SETUP", "NO CHASE"}
             and setup.get("bias") != "WAIT"
             and setup.get("execution_status") in {"ENTERABLE_NOW", "PENDING_LIMIT_ONLY"}
@@ -859,6 +868,9 @@ class MarketScanner:
 
         setup_record = alert.get("setup_scenario")
         if not isinstance(setup_record, dict):
+            return
+        if self._is_symbol_blacklisted(alert.get("symbol")):
+            self.logger.info("Skipping setup tracking for blacklisted symbol: %s", alert.get("symbol"))
             return
         if setup_record.get("execution_status") == "TOO_LATE_DO_NOT_CHASE":
             self.logger.info("Skipping too-late setup tracking: %s", alert.get("symbol"))
@@ -1109,6 +1121,11 @@ class MarketScanner:
             "NO_SETUP": "⚪ НЕТ СЕТАПА",
         }
         return labels.get(str(status or ""), labels["NO_SETUP"])
+
+    def _is_symbol_blacklisted(self, symbol: Any) -> bool:
+        symbol_text = str(symbol or "").upper()
+        blacklist = self.storage.state.get("symbol_blacklist") or config.SYMBOL_BLACKLIST
+        return symbol_text in {str(item).upper() for item in blacklist}
 
     def _execution_short_label(self, status: Any) -> str:
         labels = {
