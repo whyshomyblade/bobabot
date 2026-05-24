@@ -62,6 +62,8 @@ class Storage:
             "paper_orders": [],
             "symbol_blacklist": list(config.SYMBOL_BLACKLIST),
             "last_daily_report_date": None,
+            "REAL_TRADING_UNLOCKED": config.REAL_TRADING_UNLOCKED_DEFAULT,
+            "api_set_pending": False,
             "last_setup_tracking_ts": 0,
         }
 

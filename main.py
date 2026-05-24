@@ -36,6 +36,11 @@ from performance_analyzer import (
 )
 from risk_manager import build_order_plan_from_alert, format_order_plan
 from scanner import MarketScanner
+from setup_tracker import (
+    execution_quality_for_record,
+    fee_adjusted_result_r_for_record,
+    normalize_final_state,
+)
 from storage import Storage
 from telegram_client import (
     TelegramClient,
@@ -75,6 +80,14 @@ BUTTON_COMMANDS = {
     "📋 Ордера": "/orders",
     "📊 Позиции": "/positions",
     "💰 Баланс": "/balance",
+    "🔑 API Status": "/api_status",
+    "🧪 API Test": "/api_test",
+    "📘 API Help": "/api_help",
+    "🔄 API Reload": "/api_reload",
+    "🐺 Real Status": "/real_status",
+    "🔓 Enable Real": "/enable_real",
+    "🔒 Disable Real": "/disable_real",
+    "🚨 Panic": "/panic",
     "📤 Экспорт журнала": "/export_journal",
     "📤 Экспорт статистики": "/export_stats",
     "📤 Экспорт ордеров": "/export_orders",
@@ -205,6 +218,10 @@ def config_text() -> str:
             f"• Default leverage: {config.DEFAULT_LEVERAGE}x",
             f"• Min R/R: {config.MIN_RR_TO_ALLOW_ORDER:g}",
             f"• Allow high risk orders: {str(config.ALLOW_HIGH_RISK_ORDERS).lower()}",
+            f"• Real unlock min setups: {config.REAL_MODE_UNLOCK_MIN_CLOSED_SETUPS}",
+            f"• Real unlock min win rate: {config.REAL_MODE_UNLOCK_MIN_WIN_RATE:g}%",
+            f"• Real unlock min Net R: {config.REAL_MODE_UNLOCK_MIN_NET_R:g}R",
+            f"• Real requires realistic only: {str(config.REAL_MODE_REQUIRE_REALISTIC_ONLY).lower()}",
             "",
             "Analytics:",
             f"• Daily report: {'ON' if config.DAILY_REPORT_ENABLED else 'OFF'}",
@@ -264,6 +281,7 @@ def help_text() -> str:
             "Бот может рассчитать лимитный план, но НЕ отправляет ордер автоматически.",
             "Любой ордер требует явного подтверждения Telegram-кнопкой.",
             "По умолчанию включён paper mode: реальные ордера на Bybit не отправляются.",
+            "API и real-gate доступны в меню: 📒 Сетапы → 💰 Trading.",
             "",
             "Backtest:",
             "/backtest SYMBOL DAYS — исторический replay текущей логики сетапов.",
@@ -302,6 +320,10 @@ def handle_update(
         return
 
     text = (message.get("text") or "").strip()
+    if storage.state.get("api_set_pending") and not text.startswith("/"):
+        handle_api_set_credentials(message, text, storage, telegram)
+        return
+
     args: list[str] = []
     if text in BUTTON_COMMANDS:
         command = BUTTON_COMMANDS[text]
@@ -390,6 +412,27 @@ def dispatch_command(
         send_with_keyboard(telegram, positions_text(private_client), build_setups_menu_keyboard())
     elif command == "/balance":
         send_with_keyboard(telegram, balance_text(private_client), build_setups_menu_keyboard())
+    elif command == "/api_status":
+        send_with_keyboard(telegram, api_status_text(storage, private_client), build_setups_trading_menu_keyboard())
+    elif command == "/api_test":
+        send_with_keyboard(telegram, api_test_text(storage, private_client), build_setups_trading_menu_keyboard())
+    elif command == "/api_help":
+        send_with_keyboard(telegram, api_help_text(), build_setups_trading_menu_keyboard())
+    elif command == "/api_set":
+        storage.save_runtime_state("api_set_pending", True)
+        send_with_keyboard(telegram, api_set_prompt_text(), build_setups_trading_menu_keyboard())
+    elif command == "/api_reload":
+        send_with_keyboard(telegram, api_reload_text(private_client), build_setups_trading_menu_keyboard())
+    elif command == "/real_status":
+        send_with_keyboard(telegram, real_status_text(storage, private_client), build_setups_trading_menu_keyboard())
+    elif command == "/enable_real":
+        handle_enable_real(storage, telegram, private_client)
+    elif command == "/disable_real":
+        storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+        logging.getLogger("RealGate").warning("Real trading disabled by user command")
+        send_with_keyboard(telegram, "Real trading disabled.", build_setups_trading_menu_keyboard())
+    elif command == "/panic":
+        handle_panic(storage, telegram, private_client)
     elif command == "/pause":
         storage.state["monitoring_enabled"] = False
         storage.save()
@@ -461,10 +504,19 @@ def handle_callback_query(
     elif data.startswith("order_submit:"):
         plan_id = data.split(":", 1)[1]
         submit_order_plan(plan_id, storage, telegram, private_client)
+    elif data.startswith("order_real_confirm:"):
+        plan_id = data.split(":", 1)[1]
+        submit_real_order_after_confirmation(plan_id, storage, telegram, private_client)
     elif data.startswith("order_cancel:"):
         plan_id = data.split(":", 1)[1]
         storage.update_paper_order(plan_id, {"status": "CANCELLED"})
         send_with_keyboard(telegram, "❌ План ордера отменён.", build_main_menu_keyboard())
+    elif data == "real_unlock_step1":
+        handle_real_unlock_step1(storage, telegram, private_client)
+    elif data == "real_unlock_step2":
+        handle_real_unlock_step2(storage, telegram, private_client)
+    elif data == "real_unlock_cancel":
+        send_with_keyboard(telegram, "❌ REAL unlock отменён.", build_setups_trading_menu_keyboard())
     elif data.startswith("order_skip:"):
         send_with_keyboard(telegram, "🚫 Сетап пропущен.", build_main_menu_keyboard())
     else:
@@ -500,6 +552,469 @@ def close_menu_message(telegram: TelegramClient, message: dict[str, Any]) -> Non
     except Exception as exc:
         logging.getLogger("CommandHandler").warning("Could not delete menu message: %s", exc)
         edit_menu_message(telegram, message, "Меню закрыто.", None)
+
+
+REAL_LOCK_PHRASE = "пошел нахуй, ждем 80%+"
+
+
+def api_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    logging.getLogger("APIControl").info("API status checked")
+    checks = run_private_api_checks(private_client)
+    real_unlocked = real_trading_unlocked(storage)
+    effective_real = effective_real_trading(storage, private_client)
+    connection_ok = checks["balance_ok"] or checks["positions_ok"] or checks["orders_ok"]
+    paper_mode = not config.BYBIT_TRADING_ENABLED
+    place_order_status = "disabled"
+    if config.BYBIT_TRADING_ENABLED and private_client.has_api_keys:
+        place_order_status = "✅" if (private_client.testnet or real_unlocked) and connection_ok else "❌"
+
+    return "\n".join(
+        [
+            "🔑 Bybit API Status",
+            "",
+            f"API key: {_found_label(bool(private_client.api_key))} {mask_secret(private_client.api_key) if private_client.api_key else ''}".rstrip(),
+            f"API secret: {_found_label(bool(private_client.api_secret))}",
+            f"Mode: {'TESTNET' if private_client.testnet else 'MAINNET'}",
+            f"Trading enabled env: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+            f"Real trading unlocked: {str(real_unlocked).lower()}",
+            f"Effective real trading: {str(effective_real).lower()}",
+            f"Connection: {_ok_label(connection_ok)}",
+            f"Balance check: {_ok_label(checks['balance_ok'])}",
+            f"Positions check: {_ok_label(checks['positions_ok'])}",
+            f"Open orders check: {_ok_label(checks['orders_ok'])}",
+            "",
+            "Permissions:",
+            f"Read balance: {_ok_label(checks['balance_ok'])}",
+            f"Read positions: {_ok_label(checks['positions_ok'])}",
+            f"Read orders: {_ok_label(checks['orders_ok'])}",
+            f"Place order: {place_order_status}",
+            "",
+            "Safety:",
+            f"Real orders: {'ENABLED' if effective_real else 'LOCKED'}",
+            f"Paper mode: {'ON' if paper_mode else 'OFF'}",
+        ]
+    )
+
+
+def api_test_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    checks = run_private_api_checks(private_client)
+    logging.getLogger("APIControl").info(
+        "API test %s",
+        "success" if checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"] else "failure",
+    )
+    lines = [
+        "🧪 Bybit API Test",
+        "",
+        f"Balance: {'OK' if checks['balance_ok'] else 'ERROR'}",
+        f"Positions: {'OK' if checks['positions_ok'] else 'ERROR'}",
+        f"Orders: {'OK' if checks['orders_ok'] else 'ERROR'}",
+        f"Mode: {'TESTNET' if private_client.testnet else 'MAINNET'}",
+        f"Trading enabled env: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+        f"Real trading unlocked: {str(real_trading_unlocked(storage)).lower()}",
+    ]
+    errors = [sanitize_error(value) for value in checks["errors"] if value]
+    if errors:
+        lines.extend(["", "Errors:"])
+        lines.extend(f"- {error}" for error in errors[:3])
+    if config.BYBIT_TRADING_ENABLED and private_client.testnet:
+        lines.extend(["", "Order validation: no order placed during /api_test."])
+    return "\n".join(lines)
+
+
+def api_help_text() -> str:
+    return "\n".join(
+        [
+            "📘 Как подключить Bybit API",
+            "",
+            "Для Render:",
+            "1. Render → bobabot → Environment",
+            "2. Add:",
+            "BYBIT_API_KEY=...",
+            "BYBIT_API_SECRET=...",
+            "BYBIT_TESTNET=true",
+            "BYBIT_TRADING_ENABLED=false",
+            "3. Save",
+            "4. Manual Deploy → Clear build cache & deploy",
+            "",
+            "Для Mac:",
+            'export BYBIT_API_KEY="..."',
+            'export BYBIT_API_SECRET="..."',
+            "export BYBIT_TESTNET=true",
+            "export BYBIT_TRADING_ENABLED=false",
+            "python3 main.py",
+            "",
+            "Важно:",
+            "- сначала только TESTNET",
+            "- сначала BYBIT_TRADING_ENABLED=false",
+            "- не отправляй API secret в обычный чат",
+            "- real trading включать только после paper/testnet проверки",
+            "- real trading всё равно будет заблокирован, пока не пройдена статистика",
+        ]
+    )
+
+
+def api_set_prompt_text() -> str:
+    return "\n".join(
+        [
+            "Отправь API key и secret в формате:",
+            "API_KEY|API_SECRET",
+            "Сообщение будет удалено, если Telegram позволит.",
+            "Не используй mainnet real-trading key здесь.",
+        ]
+    )
+
+
+def handle_api_set_credentials(
+    message: dict[str, Any],
+    text: str,
+    storage: Storage,
+    telegram: TelegramClient,
+) -> None:
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    if chat_id is not None and message_id is not None:
+        try:
+            telegram.delete_message(chat_id, message_id)
+        except Exception as exc:
+            logging.getLogger("APIControl").warning("Could not delete API credential message: %s", exc)
+    storage.save_runtime_state("api_set_pending", False)
+
+    if "|" not in text:
+        send_with_keyboard(telegram, "Формат не распознан. Используй /api_help и Environment variables.", build_setups_trading_menu_keyboard())
+        return
+    api_key, _api_secret = text.split("|", 1)
+    masked = mask_secret(api_key.strip())
+    send_with_keyboard(
+        telegram,
+        "\n".join(
+            [
+                "Для безопасности используй Environment variables.",
+                "Сохранять secret в Telegram/SQLite не буду.",
+                f"Key received: {masked}",
+                "",
+                "Открой /api_help для инструкции.",
+            ]
+        ),
+        build_setups_trading_menu_keyboard(),
+    )
+
+
+def api_reload_text(private_client: BybitPrivateClient) -> str:
+    private_client.reload_from_environment()
+    logging.getLogger("APIControl").info("API config reload requested")
+    return "\n".join(
+        [
+            "🔄 API config reload выполнен из текущих environment variables.",
+            f"Mode: {private_client.mode_label()}",
+            f"API key: {_found_label(bool(private_client.api_key))}",
+            "",
+            "Для применения Render Environment нужен redeploy.",
+        ]
+    )
+
+
+def real_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    stats = real_gate_stats(storage)
+    unlocked = real_trading_unlocked(storage)
+    verdict = "Real mode can be unlocked." if stats["requirements_met"] else REAL_LOCK_PHRASE
+    return "\n".join(
+        [
+            "🐺 Real Mode Status",
+            "",
+            f"Real trading: {'ENABLED' if effective_real_trading(storage, private_client) else 'LOCKED'}",
+            f"Closed counted setups: {stats['counted_closed']} / {config.REAL_MODE_UNLOCK_MIN_CLOSED_SETUPS}",
+            f"Win rate: {stats['win_rate']:.1f}% / {config.REAL_MODE_UNLOCK_MIN_WIN_RATE:g}%",
+            f"Net R: {stats['net_r']:+.1f}R / +{config.REAL_MODE_UNLOCK_MIN_NET_R:g}R",
+            f"FAST_MOVE excluded: {'yes' if not config.REAL_MODE_COUNT_FAST_MOVE else 'no'}",
+            f"Mode: {private_client.mode_label()}",
+            f"Real trading unlocked flag: {str(unlocked).lower()}",
+            "",
+            "Verdict:",
+            verdict,
+        ]
+    )
+
+
+def handle_enable_real(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("RealGate")
+    logger.warning("Real unlock attempted")
+    stats = real_gate_stats(storage)
+    if not stats["requirements_met"]:
+        logger.warning("Real unlock rejected: performance requirements not met")
+        telegram.send_message(REAL_LOCK_PHRASE)
+        send_with_keyboard(
+            telegram,
+            "\n".join(
+                [
+                    f"Closed setups: {stats['counted_closed']} / {config.REAL_MODE_UNLOCK_MIN_CLOSED_SETUPS}",
+                    f"Win rate: {stats['win_rate']:.1f}%",
+                    f"Net R: {stats['net_r']:+.2f}R",
+                ]
+            ),
+            build_setups_trading_menu_keyboard(),
+        )
+        return
+
+    checks = run_private_api_checks(private_client)
+    if not (checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]):
+        logger.warning("Real unlock rejected: API status failed")
+        send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
+        return
+    if storage.get_runtime_state("order_lifecycle_unstable", False):
+        logger.warning("Real unlock rejected: order lifecycle unstable")
+        send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
+        return
+
+    send_with_keyboard(
+        telegram,
+        "\n".join(
+            [
+                "⚠️ REAL MODE UNLOCK AVAILABLE",
+                "",
+                "Статистика прошла фильтр:",
+                f"Closed setups: {stats['counted_closed']}",
+                f"Win rate: {stats['win_rate']:.1f}%",
+                f"Net R: {stats['net_r']:+.2f}R",
+                "",
+                "Ты реально хочешь включить торговлю на реальном рынке?",
+            ]
+        ),
+        {
+            "inline_keyboard": [
+                [{"text": "🐺 Выпустить зверя в рынок", "callback_data": "real_unlock_step1"}],
+                [{"text": "❌ Отмена", "callback_data": "real_unlock_cancel"}],
+            ]
+        },
+    )
+
+
+def handle_real_unlock_step1(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    if not real_gate_stats(storage)["requirements_met"]:
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+    telegram.send_message(
+        "\n".join(
+            [
+                "Последнее подтверждение.",
+                "После этого бот сможет ставить REAL ордера по разрешённым условиям.",
+            ]
+        ),
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "✅ Да, включить REAL", "callback_data": "real_unlock_step2"}],
+                [{"text": "❌ Нет, отмена", "callback_data": "real_unlock_cancel"}],
+            ]
+        },
+    )
+
+
+def handle_real_unlock_step2(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("RealGate")
+    stats = real_gate_stats(storage)
+    if not stats["requirements_met"]:
+        logger.warning("Real unlock rejected at second confirmation")
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+    checks = run_private_api_checks(private_client)
+    if not (checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]):
+        logger.warning("Real unlock rejected at second confirmation: API failed")
+        send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
+        return
+    if storage.get_runtime_state("order_lifecycle_unstable", False):
+        logger.warning("Real unlock rejected at second confirmation: order lifecycle unstable")
+        send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
+        return
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", True)
+    logger.warning("Real unlock enabled")
+    send_with_keyboard(
+        telegram,
+        "🐺 Зверь выпущен в рынок.\nReal trading enabled with safety filters.",
+        build_setups_trading_menu_keyboard(),
+    )
+
+
+def handle_panic(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("RealGate")
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+    cancelled = 0
+    if private_client.has_api_keys:
+        try:
+            for order in private_client.get_open_orders():
+                symbol = order.get("symbol")
+                order_id = order.get("orderId")
+                if symbol and order_id:
+                    private_client.cancel_order(str(symbol), str(order_id))
+                    cancelled += 1
+        except Exception as exc:
+            logger.error("Panic cancel failed: %s", exc)
+    logger.warning("Panic mode triggered; cancelled_orders=%s", cancelled)
+    send_with_keyboard(telegram, "PANIC MODE: real trading locked.", build_setups_trading_menu_keyboard())
+
+
+def run_private_api_checks(private_client: BybitPrivateClient) -> dict[str, Any]:
+    result = {
+        "balance_ok": False,
+        "positions_ok": False,
+        "orders_ok": False,
+        "errors": [],
+    }
+    if not private_client.has_api_keys:
+        result["errors"].append("Bybit API keys не настроены.")
+        return result
+
+    try:
+        private_client.get_account_balance()
+        result["balance_ok"] = True
+    except Exception as exc:
+        result["errors"].append(f"balance: {sanitize_error(exc)}")
+    try:
+        private_client.get_positions()
+        result["positions_ok"] = True
+    except Exception as exc:
+        result["errors"].append(f"positions: {sanitize_error(exc)}")
+    try:
+        private_client.get_open_orders()
+        result["orders_ok"] = True
+    except Exception as exc:
+        result["errors"].append(f"orders: {sanitize_error(exc)}")
+    return result
+
+
+def real_trading_unlocked(storage: Storage) -> bool:
+    return bool(storage.get_runtime_state("REAL_TRADING_UNLOCKED", config.REAL_TRADING_UNLOCKED_DEFAULT))
+
+
+def effective_real_trading(storage: Storage, private_client: BybitPrivateClient) -> bool:
+    return (
+        config.BYBIT_TRADING_ENABLED
+        and not config.BYBIT_TESTNET
+        and private_client.has_api_keys
+        and real_trading_unlocked(storage)
+    )
+
+
+def real_gate_stats(storage: Storage) -> dict[str, Any]:
+    counted = 0
+    wins = 0
+    losses = 0
+    net_r = 0.0
+    for record in storage.get_setup_journal(limit=None):
+        final_state = normalize_final_state(record)
+        if final_state in {"EXPIRED_NO_ENTRY", "EXPIRED_AFTER_ENTRY", "AMBIGUOUS_INVALIDATION_FIRST", "INVALIDATED_FIRST_UNKNOWN"}:
+            continue
+        quality = execution_quality_for_record(record)
+        if not config.REAL_MODE_COUNT_FAST_MOVE and quality in {"FAST_MOVE", "MAYBE_NOT_EXECUTABLE", "AMBIGUOUS"}:
+            continue
+        if config.REAL_MODE_REQUIRE_REALISTIC_ONLY and quality != "REALISTIC":
+            continue
+        if final_state in {"TP1_THEN_INVALIDATED", "TP1_HIT", "TP2_HIT", "INVALIDATED_BEFORE_TP1"}:
+            counted += 1
+            net_r += fee_adjusted_result_r_for_record(record)
+        if final_state in {"TP1_THEN_INVALIDATED", "TP1_HIT", "TP2_HIT"}:
+            wins += 1
+        elif final_state == "INVALIDATED_BEFORE_TP1":
+            losses += 1
+
+    win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0.0
+    requirements_met = (
+        counted >= config.REAL_MODE_UNLOCK_MIN_CLOSED_SETUPS
+        and win_rate >= config.REAL_MODE_UNLOCK_MIN_WIN_RATE
+        and net_r >= config.REAL_MODE_UNLOCK_MIN_NET_R
+    )
+    return {
+        "counted_closed": counted,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_r": net_r,
+        "requirements_met": requirements_met,
+    }
+
+
+def real_order_safety_rejections(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    plan: dict[str, Any],
+) -> list[str]:
+    reasons = []
+    if not config.BYBIT_TRADING_ENABLED:
+        reasons.append("BYBIT_TRADING_ENABLED=false")
+    if config.BYBIT_TESTNET:
+        reasons.append("BYBIT_TESTNET=true")
+    if not real_trading_unlocked(storage):
+        reasons.append("REAL_TRADING_UNLOCKED=false")
+    if not private_client.has_api_keys:
+        reasons.append("Bybit API keys не настроены.")
+    if plan.get("risk_level") == "EXTREME":
+        reasons.append("risk_level = EXTREME")
+    if plan.get("risk_level") == "HIGH" and not config.ALLOW_HIGH_RISK_ORDERS:
+        reasons.append("risk_level = HIGH, ALLOW_HIGH_RISK_ORDERS=false")
+    if plan.get("execution_status") in {"TOO_LATE_DO_NOT_CHASE", "NO_SETUP"}:
+        reasons.append("execution_status запрещён")
+    if plan.get("setup_status") == "NO SETUP":
+        reasons.append("setup_status = NO SETUP")
+    if str(plan.get("execution_quality") or "") in {"FAST_MOVE", "MAYBE_NOT_EXECUTABLE", "AMBIGUOUS"}:
+        reasons.append("execution_quality запрещён")
+    if storage.get_runtime_state("daily_loss_limit_reached", False):
+        reasons.append("daily loss limit reached")
+
+    symbol = str(plan.get("symbol") or "")
+    if symbol:
+        try:
+            if private_client.get_open_orders(symbol):
+                reasons.append("уже есть активный ордер по монете")
+            if has_active_position(private_client.get_positions(symbol)):
+                reasons.append("уже есть открытая позиция по монете")
+        except Exception as exc:
+            reasons.append(f"API status failed: {sanitize_error(exc)}")
+
+    checks = run_private_api_checks(private_client)
+    if not (checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]):
+        reasons.append("permissions/API checks failed")
+    if storage.get_runtime_state("order_lifecycle_unstable", False):
+        reasons.append("order lifecycle unstable")
+    return reasons
+
+
+def mask_secret(value: str) -> str:
+    text = str(value or "")
+    if len(text) <= 8:
+        return "****" if text else ""
+    return f"{text[:4]}********{text[-4:]}"
+
+
+def sanitize_error(value: Any) -> str:
+    text = str(value)
+    for secret in (config.BYBIT_API_SECRET, config.BYBIT_API_KEY):
+        if secret:
+            text = text.replace(secret, "[hidden]")
+    if len(text) > 180:
+        return text[:177] + "..."
+    return text
+
+
+def _found_label(value: bool) -> str:
+    return "✅ найден" if value else "❌ не найден"
+
+
+def _ok_label(value: bool) -> str:
+    return "✅ OK" if value else "❌ ERROR"
 
 
 def calculate_order_plan(
@@ -594,10 +1109,10 @@ def submit_order_plan(
         send_with_keyboard(telegram, "Bybit API keys не настроены.", build_main_menu_keyboard())
         return
 
-    if not private_client.can_trade_real:
+    if not config.BYBIT_TRADING_ENABLED:
         updated = storage.update_paper_order(plan_id, {"status": "SUBMITTED", "mode": "PAPER"})
         logger.info(
-            "Paper order submitted symbol=%s side=%s setup_id=%s execution_status=%s risk=%s",
+            "Order mode PAPER: submitted symbol=%s side=%s setup_id=%s execution_status=%s risk=%s",
             plan.get("symbol"),
             plan.get("side"),
             plan.get("source_setup_id"),
@@ -616,6 +1131,30 @@ def submit_order_plan(
                 ]
             ),
             build_main_menu_keyboard(),
+        )
+        return
+
+    if config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and not real_trading_unlocked(storage):
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "REAL_TRADING_UNLOCKED=false"})
+        logger.warning("Order rejected reason=real locked symbol=%s setup_id=%s", plan.get("symbol"), plan.get("source_setup_id"))
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+
+    if config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and real_trading_unlocked(storage):
+        reasons = real_order_safety_rejections(storage, private_client, plan)
+        if reasons:
+            storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(reasons)})
+            logger.warning("Real order rejected symbol=%s reason=%s", plan.get("symbol"), "; ".join(reasons))
+            send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {reasons[0]}", build_main_menu_keyboard())
+            return
+        telegram.send_message(
+            "⚠️ REAL MARKET MODE. Подтверди ещё раз.",
+            reply_markup={
+                "inline_keyboard": [
+                    [{"text": "⚠️ Да, отправить REAL ордер", "callback_data": f"order_real_confirm:{plan_id}"}],
+                    [{"text": "❌ Отмена", "callback_data": f"order_cancel:{plan_id}"}],
+                ]
+            },
         )
         return
 
@@ -638,7 +1177,8 @@ def submit_order_plan(
             },
         )
         logger.info(
-            "Real/testnet limit order submitted symbol=%s side=%s order_id=%s",
+            "Order mode %s: limit order submitted symbol=%s side=%s order_id=%s",
+            private_client.mode_label(),
             plan.get("symbol"),
             plan.get("side"),
             result.get("orderId"),
@@ -647,7 +1187,7 @@ def submit_order_plan(
             telegram,
             "\n".join(
                 [
-                    "✅ Лимитный ордер отправлен.",
+                    "🧪 TESTNET order sent. Это НЕ real market." if config.BYBIT_TESTNET else "✅ Лимитный ордер отправлен.",
                     f"Режим: {private_client.mode_label()}",
                     f"Монета: {plan.get('symbol')}",
                     f"Order ID: {result.get('orderId', 'n/a')}",
@@ -659,6 +1199,73 @@ def submit_order_plan(
         logger.error("Order submit failed symbol=%s error=%s", plan.get("symbol"), exc)
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": str(exc)})
         send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {exc}", build_main_menu_keyboard())
+
+
+def submit_real_order_after_confirmation(
+    plan_id: str,
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("ExecutionAssistant")
+    plan = storage.get_paper_order(plan_id)
+    if plan is None:
+        send_with_keyboard(telegram, "❌ План ордера не найден.", build_main_menu_keyboard())
+        return
+    if plan.get("status") != "PLANNED":
+        send_with_keyboard(telegram, f"❌ План уже имеет статус: {plan.get('status')}", build_main_menu_keyboard())
+        return
+    if not (config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and real_trading_unlocked(storage)):
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "real gate closed"})
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+
+    reasons = real_order_safety_rejections(storage, private_client, plan)
+    if reasons:
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(reasons)})
+        logger.warning("Real order rejected after double confirmation symbol=%s reason=%s", plan.get("symbol"), "; ".join(reasons))
+        send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {reasons[0]}", build_main_menu_keyboard())
+        return
+
+    try:
+        response = private_client.place_limit_order(
+            symbol=str(plan.get("symbol")),
+            side=str(plan.get("bybit_side")),
+            qty=str(plan.get("qty")),
+            price=str(plan.get("entry_price")),
+            reduce_only=False,
+        )
+        result = response.get("result") or {}
+        storage.update_paper_order(
+            plan_id,
+            {
+                "status": "SUBMITTED",
+                "mode": "REAL",
+                "exchange_order_id": result.get("orderId"),
+                "exchange_response": response,
+            },
+        )
+        logger.warning(
+            "Order mode REAL: limit order submitted symbol=%s side=%s order_id=%s",
+            plan.get("symbol"),
+            plan.get("side"),
+            result.get("orderId"),
+        )
+        send_with_keyboard(
+            telegram,
+            "\n".join(
+                [
+                    "✅ REAL limit order sent.",
+                    f"Монета: {plan.get('symbol')}",
+                    f"Order ID: {result.get('orderId', 'n/a')}",
+                ]
+            ),
+            build_main_menu_keyboard(),
+        )
+    except Exception as exc:
+        logger.error("Real order submit failed symbol=%s error=%s", plan.get("symbol"), sanitize_error(exc))
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": sanitize_error(exc)})
+        send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {sanitize_error(exc)}", build_main_menu_keyboard())
 
 
 def send_analytics(storage: Storage, telegram: TelegramClient) -> None:

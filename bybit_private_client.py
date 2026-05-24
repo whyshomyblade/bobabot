@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -43,7 +44,7 @@ class BybitPrivateClient:
 
     @property
     def can_call_private(self) -> bool:
-        return self.has_api_keys and self.trading_enabled
+        return self.has_api_keys
 
     def mode_label(self) -> str:
         if not self.trading_enabled:
@@ -51,6 +52,18 @@ class BybitPrivateClient:
         if self.testnet:
             return "TESTNET"
         return "REAL"
+
+    def reload_from_environment(self) -> None:
+        self.api_key = os.getenv("BYBIT_API_KEY", "").strip()
+        self.api_secret = os.getenv("BYBIT_API_SECRET", "").strip()
+        self.testnet = os.getenv("BYBIT_TESTNET", "true").strip().lower() in {"1", "true", "yes", "on"}
+        self.trading_enabled = os.getenv("BYBIT_TRADING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self.base_url = "https://api-testnet.bybit.com" if self.testnet else config.BYBIT_BASE_URL
+        config.BYBIT_API_KEY = self.api_key
+        config.BYBIT_API_SECRET = self.api_secret
+        config.BYBIT_TESTNET = self.testnet
+        config.BYBIT_TRADING_ENABLED = self.trading_enabled
+        self.logger.info("Bybit API config reloaded from environment; mode=%s", self.mode_label())
 
     def get_account_balance(self) -> dict[str, Any]:
         return self._signed_request(
