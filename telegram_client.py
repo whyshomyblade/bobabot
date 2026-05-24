@@ -44,22 +44,62 @@ def build_radar_menu_keyboard() -> dict[str, Any]:
 def build_setups_menu_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
+            [{"text": "📒 Сетапы", "callback_data": "menu:setups_core"}],
+            [{"text": "🧠 Аналитика", "callback_data": "menu:setups_analytics"}],
+            [{"text": "📤 Экспорт", "callback_data": "menu:setups_export"}],
+            [{"text": "💰 Trading", "callback_data": "menu:setups_trading"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:main"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_setups_core_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
             [{"text": "📒 Активные сетапы", "callback_data": "cmd:/setups"}],
             [{"text": "📘 Журнал", "callback_data": "cmd:/journal"}],
             [{"text": "📈 Стата", "callback_data": "cmd:/stats"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_setups_analytics_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
             [{"text": "🧠 Аналитика", "callback_data": "cmd:/analytics"}],
             [{"text": "📊 Daily Report Now", "callback_data": "cmd:/daily_report_now"}],
             [{"text": "🧪 Рекомендации", "callback_data": "cmd:/recommend_filters"}],
-            [{"text": "🧪 Backtest", "callback_data": "cmd:/backtest"}],
+            [{"text": "🧪 Backtest", "callback_data": "menu:backtest_help"}],
             [{"text": "📊 Backtest Report", "callback_data": "cmd:/backtest_report"}],
-            [{"text": "📤 Export Backtest", "callback_data": "cmd:/export_backtest"}],
-            [{"text": "📋 Ордера", "callback_data": "cmd:/orders"}],
-            [{"text": "📊 Позиции", "callback_data": "cmd:/positions"}],
-            [{"text": "💰 Баланс", "callback_data": "cmd:/balance"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_setups_export_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
             [{"text": "📤 Экспорт журнала", "callback_data": "cmd:/export_journal"}],
             [{"text": "📤 Экспорт статистики", "callback_data": "cmd:/export_stats"}],
             [{"text": "📤 Экспорт ордеров", "callback_data": "cmd:/export_orders"}],
-            [{"text": "⬅️ Назад", "callback_data": "menu:main"}],
+            [{"text": "📤 Export Backtest", "callback_data": "cmd:/export_backtest"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_setups_trading_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "📋 Ордера", "callback_data": "cmd:/orders"}],
+            [{"text": "📊 Позиции", "callback_data": "cmd:/positions"}],
+            [{"text": "💰 Баланс", "callback_data": "cmd:/balance"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
     }
@@ -291,6 +331,15 @@ class TelegramClient:
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         self._request("editMessageText", payload)
+
+    def delete_message(self, chat_id: Any, message_id: Any) -> None:
+        self._request(
+            "deleteMessage",
+            {
+                "chat_id": str(chat_id),
+                "message_id": message_id,
+            },
+        )
 
     def get_updates(
         self,

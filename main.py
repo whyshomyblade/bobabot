@@ -44,7 +44,11 @@ from telegram_client import (
     build_order_confirmation_keyboard,
     build_radar_menu_keyboard,
     build_settings_menu_keyboard,
+    build_setups_analytics_menu_keyboard,
+    build_setups_core_menu_keyboard,
+    build_setups_export_menu_keyboard,
     build_setups_menu_keyboard,
+    build_setups_trading_menu_keyboard,
 )
 
 
@@ -429,10 +433,25 @@ def handle_callback_query(
         edit_menu_message(telegram, message, "📡 Радар", build_radar_menu_keyboard())
     elif data == "menu:setups":
         edit_menu_message(telegram, message, "📒 Сетапы", build_setups_menu_keyboard())
+    elif data == "menu:setups_core":
+        edit_menu_message(telegram, message, "📒 Сетапы", build_setups_core_menu_keyboard())
+    elif data == "menu:setups_analytics":
+        edit_menu_message(telegram, message, "🧠 Аналитика", build_setups_analytics_menu_keyboard())
+    elif data == "menu:setups_export":
+        edit_menu_message(telegram, message, "📤 Экспорт", build_setups_export_menu_keyboard())
+    elif data == "menu:setups_trading":
+        edit_menu_message(telegram, message, "💰 Trading", build_setups_trading_menu_keyboard())
+    elif data == "menu:backtest_help":
+        edit_menu_message(
+            telegram,
+            message,
+            "Использование: /backtest SYMBOL DAYS\nПример: /backtest BTCUSDT 3",
+            build_setups_analytics_menu_keyboard(),
+        )
     elif data == "menu:settings":
         edit_menu_message(telegram, message, "⚙️ Настройки", build_settings_menu_keyboard())
     elif data == "menu:close":
-        edit_menu_message(telegram, message, "Меню закрыто.", None)
+        close_menu_message(telegram, message)
     elif data.startswith("cmd:"):
         command = data.split(":", 1)[1]
         dispatch_command(command, storage, telegram, scanner, private_client)
@@ -468,6 +487,19 @@ def edit_menu_message(
     except Exception as exc:
         logging.getLogger("CommandHandler").warning("Could not edit menu message: %s", exc)
         telegram.send_message(text, reply_markup=reply_markup or build_main_menu_keyboard())
+
+
+def close_menu_message(telegram: TelegramClient, message: dict[str, Any]) -> None:
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    if chat_id is None or message_id is None:
+        telegram.send_message("Меню закрыто.", reply_markup=build_main_menu_keyboard())
+        return
+    try:
+        telegram.delete_message(chat_id, message_id)
+    except Exception as exc:
+        logging.getLogger("CommandHandler").warning("Could not delete menu message: %s", exc)
+        edit_menu_message(telegram, message, "Меню закрыто.", None)
 
 
 def calculate_order_plan(
