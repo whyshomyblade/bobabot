@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Any
 
 import config
+from backtester import (
+    BACKTEST_EXPORT_FIELDS,
+    Backtester,
+    backtest_export_rows,
+    format_backtest_report,
+    format_backtest_result,
+    format_backtest_top,
+)
 from bybit_client import BybitClient
 from bybit_private_client import BybitPrivateClient
 from health_server import start_health_server
@@ -18,6 +26,7 @@ from performance_analyzer import (
     ORDERS_EXPORT_FIELDS,
     STATS_EXPORT_FIELDS,
     analyze_performance,
+    format_dataset_progress,
     format_analytics,
     format_daily_report,
     format_recommendations,
@@ -65,6 +74,9 @@ BUTTON_COMMANDS = {
     "📤 Экспорт журнала": "/export_journal",
     "📤 Экспорт статистики": "/export_stats",
     "📤 Экспорт ордеров": "/export_orders",
+    "🧪 Backtest": "/backtest",
+    "📊 Backtest Report": "/backtest_report",
+    "📤 Export Backtest": "/export_backtest",
     "📒 Setups": "/setups",
     "📘 Journal": "/journal",
     "📈 Stats": "/stats",
@@ -84,6 +96,7 @@ def status_text(storage: Storage) -> str:
     last_scan_time = storage.state.get("last_scan_time") or "never"
     symbols_count = len(storage.state.get("symbols", []))
     alerts_today = storage.state.get("alerts_today", {}).get("count", 0)
+    closed_setups = len(storage.get_setup_journal(limit=None))
 
     return "\n".join(
         [
@@ -93,6 +106,8 @@ def status_text(storage: Storage) -> str:
             f"Min 24h turnover filter: {config.MIN_24H_TURNOVER_USDT:,.0f} USDT",
             f"Last scan time: {last_scan_time}",
             f"Alerts today: {alerts_today}",
+            "",
+            format_dataset_progress(closed_setups),
         ]
     )
 
@@ -106,6 +121,7 @@ def debug_state_text(storage: Storage) -> str:
             f"Записей журнала: {storage.database.count_setup_journal()}",
             f"История алертов: {storage.database.count_alert_history()}",
             f"Paper/orders records: {storage.database.count_paper_orders()}",
+            f"Backtest trades: {storage.database.count_backtest_trades()}",
             f"Последний скан: {storage.state.get('last_scan_time') or 'never'}",
             f"Hosting mode: {'ON' if config.HOSTING_MODE else 'OFF'}",
         ]
@@ -190,6 +206,14 @@ def config_text() -> str:
             f"• Daily report: {'ON' if config.DAILY_REPORT_ENABLED else 'OFF'}",
             f"• Daily report hour UTC: {config.DAILY_REPORT_HOUR_UTC}",
             f"• Symbol blacklist: {len(config.SYMBOL_BLACKLIST)} default symbols",
+            "",
+            "Backtest:",
+            f"• Backtest: {'ON' if config.BACKTEST_ENABLED else 'OFF'}",
+            f"• Default days: {config.BACKTEST_DEFAULT_DAYS}",
+            f"• Default interval: {config.BACKTEST_DEFAULT_INTERVAL}",
+            f"• Max symbols: {config.BACKTEST_MAX_SYMBOLS}",
+            f"• Min 24h turnover: {config.BACKTEST_MIN_24H_TURNOVER:,.0f} USDT",
+            f"• Max candles/symbol: {config.BACKTEST_MAX_CANDLES_PER_SYMBOL}",
         ]
     )
 
@@ -236,6 +260,12 @@ def help_text() -> str:
             "Бот может рассчитать лимитный план, но НЕ отправляет ордер автоматически.",
             "Любой ордер требует явного подтверждения Telegram-кнопкой.",
             "По умолчанию включён paper mode: реальные ордера на Bybit не отправляются.",
+            "",
+            "Backtest:",
+            "/backtest SYMBOL DAYS — исторический replay текущей логики сетапов.",
+            "/backtest_report — последний отчёт backtest.",
+            "/export_backtest — экспорт сделок backtest в CSV/JSON.",
+            "Исторический тест не доказывает будущую прибыль: OI/funding, задержки, проскальзывание и лимитное исполнение могут отличаться.",
         ]
     )
 
@@ -331,6 +361,14 @@ def dispatch_command(
         export_stats(storage, telegram)
     elif command == "/export_orders":
         export_orders(storage, telegram)
+    elif command == "/backtest":
+        run_backtest_command(storage, telegram, scanner, args)
+    elif command == "/backtest_report":
+        send_backtest_report(storage, telegram)
+    elif command == "/backtest_top":
+        send_backtest_top(storage, telegram)
+    elif command == "/export_backtest":
+        export_backtest(storage, telegram)
     elif command == "/blacklist":
         send_with_keyboard(telegram, blacklist_text(storage), build_setups_menu_keyboard())
     elif command == "/blacklist_add":
@@ -675,6 +713,68 @@ def export_orders(storage: Storage, telegram: TelegramClient) -> None:
     except Exception as exc:
         logging.getLogger("Analytics").error("Orders export failed: %s", exc)
         send_with_keyboard(telegram, "Ошибка аналитики, сканер продолжает работать.", build_setups_menu_keyboard())
+
+
+def run_backtest_command(
+    storage: Storage,
+    telegram: TelegramClient,
+    scanner: MarketScanner,
+    args: list[str],
+) -> None:
+    try:
+        symbol = args[0].upper() if args else "BTCUSDT"
+        days = config.BACKTEST_DEFAULT_DAYS
+        if len(args) >= 2:
+            try:
+                days = max(int(args[1]), 1)
+            except ValueError:
+                send_with_keyboard(telegram, "Использование: /backtest SYMBOL DAYS", build_setups_menu_keyboard())
+                return
+
+        send_with_keyboard(
+            telegram,
+            f"🧪 Backtest started: {symbol} {days}d. Live scanner продолжает работать.",
+            build_setups_menu_keyboard(),
+        )
+        backtester = Backtester(scanner.bybit, storage, scanner)
+        result = backtester.run([symbol], days=days, interval=config.BACKTEST_DEFAULT_INTERVAL)
+        send_with_keyboard(telegram, format_backtest_result(result), build_setups_menu_keyboard())
+    except Exception as exc:
+        logging.getLogger("Backtest").error("Backtest command failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка backtest, live scanner продолжает работать.", build_setups_menu_keyboard())
+
+
+def send_backtest_report(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        run = storage.get_last_backtest_run()
+        trades = storage.get_backtest_trades(run_id=run.get("id")) if run else []
+        send_with_keyboard(telegram, format_backtest_report(run, trades), build_setups_menu_keyboard())
+    except Exception as exc:
+        logging.getLogger("Backtest").error("Backtest report failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка backtest, live scanner продолжает работать.", build_setups_menu_keyboard())
+
+
+def send_backtest_top(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        run = storage.get_last_backtest_run()
+        trades = storage.get_backtest_trades(run_id=run.get("id")) if run else []
+        send_with_keyboard(telegram, format_backtest_top(run, trades), build_setups_menu_keyboard())
+    except Exception as exc:
+        logging.getLogger("Backtest").error("Backtest top failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка backtest, live scanner продолжает работать.", build_setups_menu_keyboard())
+
+
+def export_backtest(storage: Storage, telegram: TelegramClient) -> None:
+    try:
+        run = storage.get_last_backtest_run()
+        if not run:
+            send_with_keyboard(telegram, "Backtest данных пока нет. Запусти /backtest SYMBOL DAYS.", build_setups_menu_keyboard())
+            return
+        rows = backtest_export_rows(storage.get_backtest_trades(run_id=run.get("id")))
+        send_export_files(telegram, "backtest_export", rows, BACKTEST_EXPORT_FIELDS)
+    except Exception as exc:
+        logging.getLogger("Backtest").error("Backtest export failed: %s", exc)
+        send_with_keyboard(telegram, "Ошибка backtest, live scanner продолжает работать.", build_setups_menu_keyboard())
 
 
 def send_export_files(

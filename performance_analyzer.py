@@ -62,8 +62,11 @@ STATS_EXPORT_FIELDS = [
     "group_name",
     "count",
     "tp1_rate",
+    "tp1_only_rate",
     "tp2_rate",
-    "invalidation_rate",
+    "sl_before_tp1_rate",
+    "broken_after_tp1_rate",
+    "total_broken_rate",
     "expired_rate",
     "raw_avg_r",
     "net_avg_r",
@@ -89,15 +92,23 @@ def analyze_performance(
     raw_total = sum(_float(row.get("raw_r")) or 0 for row in rows)
     net_total = sum(_float(row.get("net_r")) or 0 for row in rows)
 
+    tp1_only = _count(rows, {"TP1 only"})
+    tp2 = _count(rows, {"+2.5R"})
+    sl_before_tp1 = _count_state(rows, {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST"})
+    broken_after_tp1 = _count_state(rows, {"TP1_THEN_INVALIDATED"})
+    expired = _count_state(rows, {"EXPIRED_NO_ENTRY", "EXPIRED_AFTER_ENTRY"})
+
     summary = {
         "total_closed": total,
         "active_setups": len(active_setups or []),
         "activated_count": sum(1 for row in rows if row.get("activated_at")),
-        "expired_setups": _count(rows, {"EXPIRED_NO_ENTRY", "EXPIRED_AFTER_ENTRY"}),
-        "tp1_only": _count(rows, {"TP1 only"}),
-        "tp2": _count(rows, {"+2.5R"}),
-        "sl_before_tp1": _count_state(rows, {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST"}),
-        "sl_after_tp1": _count_state(rows, {"TP1_THEN_INVALIDATED"}),
+        "expired_setups": expired,
+        "tp1_only": tp1_only,
+        "tp2": tp2,
+        "sl_before_tp1": sl_before_tp1,
+        "broken_after_tp1": broken_after_tp1,
+        "sl_after_tp1": broken_after_tp1,
+        "total_broken": sl_before_tp1 + broken_after_tp1,
         "expired_before_entry": _count_state(rows, {"EXPIRED_NO_ENTRY"}),
         "expired_after_entry": _count_state(rows, {"EXPIRED_AFTER_ENTRY"}),
         "raw_total_r": raw_total,
@@ -105,10 +116,16 @@ def analyze_performance(
         "raw_average_r": raw_total / total if total else 0.0,
         "net_average_r": net_total / total if total else 0.0,
         "win_rate_tp1_plus": _rate(_count_tp1_plus(rows), total),
-        "tp2_rate": _rate(_count(rows, {"+2.5R"}), total),
-        "invalidation_rate": _rate(_count_state(rows, {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST", "TP1_THEN_INVALIDATED"}), total),
+        "tp1_only_rate": _rate(tp1_only, total),
+        "tp2_rate": _rate(tp2, total),
+        "sl_before_tp1_rate": _rate(sl_before_tp1, total),
+        "broken_after_tp1_rate": _rate(broken_after_tp1, total),
+        "total_broken_rate": _rate(sl_before_tp1 + broken_after_tp1, total),
+        "expired_rate": _rate(expired, total),
+        "invalidation_rate": _rate(sl_before_tp1, total),
         "expectancy_net_r": net_total / total if total else 0.0,
         "new_alerts": _count_alerts(alert_records or [], since),
+        "dataset_progress": dataset_progress(total),
     }
 
     groups = {
@@ -188,9 +205,12 @@ def stats_export_rows(analysis: dict[str, Any]) -> list[dict[str, Any]]:
             "group_name": "all",
             "count": summary.get("total_closed", 0),
             "tp1_rate": summary.get("win_rate_tp1_plus", 0),
+            "tp1_only_rate": summary.get("tp1_only_rate", 0),
             "tp2_rate": summary.get("tp2_rate", 0),
-            "invalidation_rate": summary.get("invalidation_rate", 0),
-            "expired_rate": 0,
+            "sl_before_tp1_rate": summary.get("sl_before_tp1_rate", 0),
+            "broken_after_tp1_rate": summary.get("broken_after_tp1_rate", 0),
+            "total_broken_rate": summary.get("total_broken_rate", 0),
+            "expired_rate": summary.get("expired_rate", 0),
             "raw_avg_r": summary.get("raw_average_r", 0),
             "net_avg_r": summary.get("net_average_r", 0),
             "net_total_r": summary.get("net_total_r", 0),
@@ -219,8 +239,14 @@ def format_analytics(analysis: dict[str, Any]) -> str:
         f"Net R: {_fmt_r(summary.get('net_total_r'))}",
         f"Avg Net R: {_fmt_r(summary.get('net_average_r'))}",
         f"TP1 rate: {_fmt_pct(summary.get('win_rate_tp1_plus'))}",
+        f"TP1 only rate: {_fmt_pct(summary.get('tp1_only_rate'))}",
         f"TP2 rate: {_fmt_pct(summary.get('tp2_rate'))}",
-        f"Invalidation rate: {_fmt_pct(summary.get('invalidation_rate'))}",
+        f"SL before TP1 rate: {_fmt_pct(summary.get('sl_before_tp1_rate'))}",
+        f"Broken after TP1 rate: {_fmt_pct(summary.get('broken_after_tp1_rate'))}",
+        f"Total broken rate: {_fmt_pct(summary.get('total_broken_rate'))}",
+        f"Expired rate: {_fmt_pct(summary.get('expired_rate'))}",
+        "",
+        format_dataset_progress(total),
     ]
     if total < 30:
         lines.extend(["", "⚠️ Данных мало. Выводы пока слабые."])
@@ -302,11 +328,21 @@ def format_daily_report(
         f"TP1 only: {summary.get('tp1_only', 0)}",
         f"TP2: {summary.get('tp2', 0)}",
         f"SL before TP1: {summary.get('sl_before_tp1', 0)}",
-        f"SL after TP1: {summary.get('sl_after_tp1', 0)}",
+        f"Broken after TP1: {summary.get('broken_after_tp1', 0)}",
+        f"Total broken: {summary.get('total_broken', 0)}",
         f"Expired: {summary.get('expired_setups', 0)}",
         "",
         f"Raw R: {_fmt_r(summary.get('raw_total_r'))}",
         f"Net R: {_fmt_r(summary.get('net_total_r'))}",
+        "",
+        f"TP1 only rate: {_fmt_pct(summary.get('tp1_only_rate'))}",
+        f"TP2 rate: {_fmt_pct(summary.get('tp2_rate'))}",
+        f"SL before TP1 rate: {_fmt_pct(summary.get('sl_before_tp1_rate'))}",
+        f"Broken after TP1 rate: {_fmt_pct(summary.get('broken_after_tp1_rate'))}",
+        f"Total broken rate: {_fmt_pct(summary.get('total_broken_rate'))}",
+        f"Expired rate: {_fmt_pct(summary.get('expired_rate'))}",
+        "",
+        format_dataset_progress(int(summary.get("total_closed") or 0)),
         "",
         "Лучший сетап:",
         _format_setup_line(best),
@@ -343,6 +379,40 @@ def recommendation_summary(analysis: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def dataset_progress(total_closed: int) -> dict[str, Any]:
+    total = max(int(total_closed or 0), 0)
+    need_more = max(100 - total, 0)
+    progress = min((total / 100) * 100, 100.0)
+    if total < 30:
+        quality = "очень слабая выборка"
+    elif total < 100:
+        quality = "ранняя выборка"
+    elif total < 300:
+        quality = "рабочая выборка"
+    else:
+        quality = "сильная выборка"
+    return {
+        "closed": total,
+        "target": 100,
+        "progress": progress,
+        "need_more": need_more,
+        "sample_quality": quality,
+    }
+
+
+def format_dataset_progress(total_closed: int) -> str:
+    progress = dataset_progress(total_closed)
+    return "\n".join(
+        [
+            "📦 Dataset progress:",
+            f"Closed setups: {progress['closed']} / {progress['target']}",
+            f"Progress: {progress['progress']:.0f}%",
+            f"Need more: {progress['need_more']} setups",
+            f"Sample quality: {progress['sample_quality']}",
+        ]
+    )
+
+
 def _group(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -357,8 +427,12 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": count,
         "tp1_rate": _rate(_count_tp1_plus(rows), count),
+        "tp1_only_rate": _rate(_count(rows, {"TP1 only"}), count),
         "tp2_rate": _rate(_count(rows, {"+2.5R"}), count),
-        "invalidation_rate": _rate(_count_state(rows, {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST", "TP1_THEN_INVALIDATED"}), count),
+        "sl_before_tp1_rate": _rate(_count_state(rows, {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST"}), count),
+        "broken_after_tp1_rate": _rate(_count_state(rows, {"TP1_THEN_INVALIDATED"}), count),
+        "total_broken_rate": _rate(_count_state(rows, {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST", "TP1_THEN_INVALIDATED"}), count),
+        "invalidation_rate": _rate(_count_state(rows, {"INVALIDATED_BEFORE_TP1", "AMBIGUOUS_INVALIDATION_FIRST"}), count),
         "expired_rate": _rate(_count_state(rows, {"EXPIRED_NO_ENTRY", "EXPIRED_AFTER_ENTRY"}), count),
         "raw_avg_r": sum(raw_values) / count if count else 0,
         "net_avg_r": sum(net_values) / count if count else 0,
@@ -449,12 +523,19 @@ def _format_ranked_groups(groups: list[tuple[str, dict[str, Any]]], positive: bo
     if not groups:
         return ["нет данных"]
     lines = []
-    for index, (name, data) in enumerate(groups[:3], start=1):
+    for name, data in groups:
+        if not positive and data.get("net_avg_r", 0) >= 0:
+            continue
+        index = len(lines) + 1
         extra = f"TP2 {_fmt_pct(data.get('tp2_rate'))}" if positive else f"SL {_fmt_pct(data.get('invalidation_rate'))}"
         lines.append(
             f"{index}. {name}: {data.get('count', 0)} сделок | Avg {_fmt_r(data.get('net_avg_r'))} | {extra}"
         )
-    return lines
+        if len(lines) >= 3:
+            break
+    if not lines and not positive:
+        return ["нет отрицательных групп"]
+    return lines or ["нет данных"]
 
 
 def _positive_recommendations(
@@ -485,6 +566,8 @@ def _top_group_name(groups: dict[str, dict[str, Any]], best: bool) -> str:
     if not ranked:
         return "нет данных"
     name, data = ranked[0]
+    if not best and data.get("net_avg_r", 0) >= 0:
+        return "нет отрицательных групп"
     return f"{name} | Avg {_fmt_r(data.get('net_avg_r'))}"
 
 

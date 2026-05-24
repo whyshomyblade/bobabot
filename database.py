@@ -77,6 +77,50 @@ class BotDatabase:
                 )
                 """
             )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backtest_runs (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    symbols TEXT,
+                    days INTEGER,
+                    interval TEXT,
+                    config_snapshot_json TEXT,
+                    total_trades INTEGER,
+                    net_r REAL,
+                    raw_r REAL,
+                    notes TEXT,
+                    data TEXT NOT NULL
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backtest_trades (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    symbol TEXT,
+                    side TEXT,
+                    alert_type TEXT,
+                    risk_level TEXT,
+                    execution_status TEXT,
+                    execution_quality TEXT,
+                    entry_price REAL,
+                    stop_price REAL,
+                    tp1 REAL,
+                    tp2 REAL,
+                    result_type TEXT,
+                    raw_r REAL,
+                    net_r REAL,
+                    opened_at TEXT,
+                    closed_at TEXT,
+                    close_reason TEXT,
+                    data_quality TEXT,
+                    data TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -332,6 +376,114 @@ class BotDatabase:
     def count_paper_orders(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0])
 
+    def add_backtest_run(self, record: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(record.get("id") or self._record_id("backtest_run", record))
+        created_at = str(record.get("created_at") or self._now())
+        record["id"] = record_id
+        record["created_at"] = created_at
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO backtest_runs
+                    (id, created_at, symbols, days, interval, config_snapshot_json,
+                     total_trades, net_r, raw_r, notes, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    created_at,
+                    ",".join(str(symbol) for symbol in (record.get("symbols") or [])),
+                    record.get("days"),
+                    record.get("interval"),
+                    self._dumps(record.get("config_snapshot") or {}),
+                    record.get("total_trades", 0),
+                    record.get("net_r", 0.0),
+                    record.get("raw_r", 0.0),
+                    "\n".join(record.get("notes") or []),
+                    self._dumps(record),
+                ),
+            )
+        return record
+
+    def get_backtest_runs(self, limit: int | None = None) -> list[dict[str, Any]]:
+        query = "SELECT data FROM backtest_runs ORDER BY rowid DESC"
+        params: tuple[Any, ...] = ()
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params = (limit,)
+        rows = self.connection.execute(query, params).fetchall()
+        return [
+            record
+            for record in (self._loads(row["data"], {}) for row in rows)
+            if isinstance(record, dict)
+        ]
+
+    def get_last_backtest_run(self) -> dict[str, Any] | None:
+        runs = self.get_backtest_runs(limit=1)
+        return runs[0] if runs else None
+
+    def add_backtest_trade(self, record: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(record.get("id") or self._record_id("backtest_trade", record))
+        record["id"] = record_id
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO backtest_trades
+                    (id, run_id, symbol, side, alert_type, risk_level, execution_status,
+                     execution_quality, entry_price, stop_price, tp1, tp2, result_type,
+                     raw_r, net_r, opened_at, closed_at, close_reason, data_quality,
+                     data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    record.get("run_id"),
+                    record.get("symbol"),
+                    record.get("side"),
+                    record.get("alert_type"),
+                    record.get("risk_level"),
+                    record.get("execution_status"),
+                    record.get("execution_quality"),
+                    record.get("entry_price"),
+                    record.get("stop_price"),
+                    record.get("tp1"),
+                    record.get("tp2"),
+                    record.get("result_type"),
+                    record.get("raw_r"),
+                    record.get("net_r"),
+                    record.get("opened_at"),
+                    record.get("closed_at"),
+                    record.get("close_reason"),
+                    record.get("data_quality"),
+                    self._dumps(record),
+                    self._now(),
+                ),
+            )
+        return record
+
+    def get_backtest_trades(
+        self,
+        run_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT data FROM backtest_trades"
+        params: list[Any] = []
+        if run_id:
+            query += " WHERE run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY rowid DESC"
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.connection.execute(query, tuple(params)).fetchall()
+        records = [self._loads(row["data"], {}) for row in rows]
+        records = [record for record in records if isinstance(record, dict)]
+        records.reverse()
+        return records
+
+    def count_backtest_trades(self) -> int:
+        return int(self.connection.execute("SELECT COUNT(*) FROM backtest_trades").fetchone()[0])
+
     def backup_before_phase7(self) -> Path | None:
         if self.get_runtime_state("phase7_backup_completed", False):
             return None
@@ -344,6 +496,20 @@ class BotDatabase:
         shutil.copy2(self.path, backup_path)
         self.save_runtime_state("phase7_backup_completed", True)
         self.logger.info("Created Phase 7 DB backup: %s", backup_path)
+        return backup_path
+
+    def backup_before_phase8(self) -> Path | None:
+        if self.get_runtime_state("phase8_backup_completed", False):
+            return None
+        if not self.path.exists():
+            self.save_runtime_state("phase8_backup_completed", True)
+            return None
+
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        backup_path = self.path.with_name(f"backup_before_phase8_{timestamp}.db")
+        shutil.copy2(self.path, backup_path)
+        self.save_runtime_state("phase8_backup_completed", True)
+        self.logger.info("Created Phase 8 DB backup: %s", backup_path)
         return backup_path
 
     def migrate_from_state_json(self, state_path: str | Path) -> None:

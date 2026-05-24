@@ -38,6 +38,7 @@ class Storage:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.database.migrate_from_state_json(self.path)
         self.database.backup_before_phase7()
+        self.database.backup_before_phase8()
         self.state = self.load()
         self._normalize()
         self.save()
@@ -212,6 +213,25 @@ class Storage:
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.database.get_paper_orders(statuses=statuses, limit=limit)
+
+    def add_backtest_run(self, record: dict[str, Any]) -> dict[str, Any]:
+        return self.database.add_backtest_run(record)
+
+    def get_backtest_runs(self, limit: int | None = None) -> list[dict[str, Any]]:
+        return self.database.get_backtest_runs(limit=limit)
+
+    def get_last_backtest_run(self) -> dict[str, Any] | None:
+        return self.database.get_last_backtest_run()
+
+    def add_backtest_trade(self, record: dict[str, Any]) -> dict[str, Any]:
+        return self.database.add_backtest_trade(record)
+
+    def get_backtest_trades(
+        self,
+        run_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.database.get_backtest_trades(run_id=run_id, limit=limit)
 
     def save_runtime_state(self, key: str, value: Any) -> None:
         self.state[key] = value

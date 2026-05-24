@@ -137,18 +137,69 @@ class BybitClient:
         symbol: str,
         interval: str,
         limit: int,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
     ) -> list[Any]:
-        payload = self._get(
-            "/v5/market/kline",
-            {
-                "category": "linear",
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit,
-            },
-        )
+        params: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        }
+        if start_ms is not None:
+            params["start"] = start_ms
+        if end_ms is not None:
+            params["end"] = end_ms
+
+        payload = self._get("/v5/market/kline", params)
         result = payload.get("result", {})
         klines = result.get("list", [])
         if not isinstance(klines, list):
             return []
         return klines
+
+    def get_open_interest_history(
+        self,
+        symbol: str,
+        interval_time: str = "5min",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "intervalTime": interval_time,
+            "limit": limit,
+        }
+        if start_ms is not None:
+            params["startTime"] = start_ms
+        if end_ms is not None:
+            params["endTime"] = end_ms
+
+        payload = self._get("/v5/market/open-interest", params)
+        result = payload.get("result", {})
+        items = result.get("list", [])
+        return items if isinstance(items, list) else []
+
+    def get_funding_history(
+        self,
+        symbol: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "limit": limit,
+        }
+        if start_ms is not None:
+            params["startTime"] = start_ms
+        if end_ms is not None:
+            params["endTime"] = end_ms
+
+        payload = self._get("/v5/market/funding/history", params)
+        result = payload.get("result", {})
+        items = result.get("list", [])
+        return items if isinstance(items, list) else []

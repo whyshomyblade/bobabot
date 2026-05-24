@@ -6,6 +6,7 @@ from typing import Any
 import config
 from bybit_client import BybitClient
 from indicators import analyze_indicator_context
+from performance_analyzer import format_dataset_progress
 from setup_generator import generate_setup
 from setup_tracker import (
     create_active_setup_from_alert,
@@ -375,15 +376,20 @@ class MarketScanner:
         too_late_count = stats.get("too_late_count", 0)
         no_setup_count = stats.get("no_setup_count", 0)
         tp1_reached = tp1_only + tp2_hit
+        total_broken = invalidated_before_tp1 + invalidated_after_tp1
 
         lines = [
             "📈 Статистика сетапов",
             "",
             f"Закрыто всего: {total}",
+            "",
+            format_dataset_progress(total),
+            "",
             f"TP1 only: {tp1_only}",
             f"TP2 достигнут: {tp2_hit}",
             f"Сломано до TP1: {invalidated_before_tp1}",
             f"Сломано после TP1: {invalidated_after_tp1}",
+            f"Всего сломано: {total_broken}",
             f"Истекло без входа: {expired_no_entry}",
             f"Истекло после входа: {expired_after_entry}",
             f"Realistic TP1: {realistic_tp1}",
@@ -394,8 +400,11 @@ class MarketScanner:
             f"Fee-adjusted average R: {fee_adjusted_average_r:+.2f}R",
             "",
             f"TP1 rate: {self._format_rate(tp1_reached, total)}",
+            f"TP1 only rate: {self._format_rate(tp1_only, total)}",
             f"TP2 rate: {self._format_rate(tp2_hit, total)}",
             f"Invalidation before TP1 rate: {self._format_rate(invalidated_before_tp1, total)}",
+            f"Broken after TP1 rate: {self._format_rate(invalidated_after_tp1, total)}",
+            f"Total broken rate: {self._format_rate(total_broken, total)}",
             "",
             "По исполнению:",
             f"Можно сейчас: {enterable_now_count}",

@@ -10,5 +10,7 @@ backup_*.db
 *.db
 *_export_*.csv
 *_export_*.json
+backtest_export_*.csv
+backtest_export_*.json
 __pycache__/
 *.pyc

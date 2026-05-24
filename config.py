@@ -23,6 +23,10 @@ def _env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None:
         return default
+    try:
+        return float(value.strip())
+    except ValueError:
+        return default
 
 
 def _env_list(name: str, default: list[str] | None = None) -> list[str]:
@@ -30,10 +34,6 @@ def _env_list(name: str, default: list[str] | None = None) -> list[str]:
     if value is None:
         return list(default or [])
     return [item.strip().upper() for item in value.split(",") if item.strip()]
-    try:
-        return float(value.strip())
-    except ValueError:
-        return default
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -123,6 +123,13 @@ DAILY_REPORT_ENABLED = _env_bool("DAILY_REPORT_ENABLED", True)
 DAILY_REPORT_HOUR_UTC = _env_int("DAILY_REPORT_HOUR_UTC", 21)
 DAILY_REPORT_CHAT_ID = os.getenv("DAILY_REPORT_CHAT_ID", TELEGRAM_CHAT_ID).strip()
 SYMBOL_BLACKLIST = _env_list("SYMBOL_BLACKLIST", [])
+
+BACKTEST_ENABLED = _env_bool("BACKTEST_ENABLED", True)
+BACKTEST_DEFAULT_DAYS = _env_int("BACKTEST_DEFAULT_DAYS", 7)
+BACKTEST_DEFAULT_INTERVAL = os.getenv("BACKTEST_DEFAULT_INTERVAL", "1m").strip() or "1m"
+BACKTEST_MAX_SYMBOLS = _env_int("BACKTEST_MAX_SYMBOLS", 50)
+BACKTEST_MIN_24H_TURNOVER = _env_float("BACKTEST_MIN_24H_TURNOVER", 5_000_000)
+BACKTEST_MAX_CANDLES_PER_SYMBOL = _env_int("BACKTEST_MAX_CANDLES_PER_SYMBOL", 10_000)
 
 LOOKBACK_MINUTES = 15
 SYMBOL_REFRESH_INTERVAL_MINUTES = 30
