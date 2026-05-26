@@ -96,18 +96,53 @@ def build_setups_export_menu_keyboard() -> dict[str, Any]:
 def build_setups_trading_menu_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
+            [{"text": "📋 Orders", "callback_data": "menu:trading_orders"}],
+            [{"text": "🔑 API", "callback_data": "menu:trading_api"}],
+            [{"text": "🐺 Real Gate", "callback_data": "menu:trading_real"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_orders_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
             [{"text": "📋 Ордера", "callback_data": "cmd:/orders"}],
             [{"text": "📊 Позиции", "callback_data": "cmd:/positions"}],
             [{"text": "💰 Баланс", "callback_data": "cmd:/balance"}],
+            [{"text": "🚫 Cancel All TESTNET", "callback_data": "cmd:/cancel_all_testnet"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_api_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
             [{"text": "🔑 API Status", "callback_data": "cmd:/api_status"}],
             [{"text": "🧪 API Test", "callback_data": "cmd:/api_test"}],
             [{"text": "📘 API Help", "callback_data": "cmd:/api_help"}],
+            [{"text": "🔐 API Set", "callback_data": "cmd:/api_set"}],
+            [{"text": "🧹 API Clear", "callback_data": "cmd:/api_clear"}],
+            [{"text": "🔁 API Mode Testnet", "callback_data": "cmd:/api_mode testnet"}],
+            [{"text": "🔁 API Mode Mainnet", "callback_data": "cmd:/api_mode mainnet"}],
             [{"text": "🔄 API Reload", "callback_data": "cmd:/api_reload"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_real_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
             [{"text": "🐺 Real Status", "callback_data": "cmd:/real_status"}],
             [{"text": "🔓 Enable Real", "callback_data": "cmd:/enable_real"}],
             [{"text": "🔒 Disable Real", "callback_data": "cmd:/disable_real"}],
             [{"text": "🚨 Panic", "callback_data": "cmd:/panic"}],
-            [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
     }

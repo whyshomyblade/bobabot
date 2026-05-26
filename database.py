@@ -79,6 +79,20 @@ class BotDatabase:
             )
             self.connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS api_credentials (
+                    id TEXT PRIMARY KEY,
+                    api_key TEXT NOT NULL,
+                    api_secret TEXT NOT NULL,
+                    masked_key TEXT,
+                    mode TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+            self.connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS backtest_runs (
                     id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
@@ -375,6 +389,80 @@ class BotDatabase:
 
     def count_paper_orders(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0])
+
+    def save_api_credentials(
+        self,
+        api_key: str,
+        api_secret: str,
+        masked_key: str,
+        mode: str = "TESTNET",
+    ) -> dict[str, Any]:
+        credential_id = f"api_{uuid.uuid4().hex}"
+        now = self._now()
+        mode = "MAINNET" if str(mode).upper() == "MAINNET" else "TESTNET"
+        with self.connection:
+            self.connection.execute("UPDATE api_credentials SET active = 0, updated_at = ?", (now,))
+            self.connection.execute(
+                """
+                INSERT INTO api_credentials
+                    (id, api_key, api_secret, masked_key, mode, created_at, updated_at, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (credential_id, api_key, api_secret, masked_key, mode, now, now),
+            )
+        return {
+            "id": credential_id,
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "masked_key": masked_key,
+            "mode": mode,
+            "created_at": now,
+            "updated_at": now,
+            "active": True,
+        }
+
+    def get_active_api_credentials(self) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT id, api_key, api_secret, masked_key, mode, created_at, updated_at, active
+            FROM api_credentials
+            WHERE active = 1
+            ORDER BY rowid DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "api_key": row["api_key"],
+            "api_secret": row["api_secret"],
+            "masked_key": row["masked_key"],
+            "mode": row["mode"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "active": bool(row["active"]),
+        }
+
+    def clear_api_credentials(self) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE api_credentials SET active = 0, updated_at = ? WHERE active = 1",
+                (self._now(),),
+            )
+
+    def update_active_api_mode(self, mode: str) -> dict[str, Any] | None:
+        credential = self.get_active_api_credentials()
+        if credential is None:
+            return None
+        mode = "MAINNET" if str(mode).upper() == "MAINNET" else "TESTNET"
+        with self.connection:
+            self.connection.execute(
+                "UPDATE api_credentials SET mode = ?, updated_at = ? WHERE id = ?",
+                (mode, self._now(), credential["id"]),
+            )
+        credential["mode"] = mode
+        return credential
 
     def add_backtest_run(self, record: dict[str, Any]) -> dict[str, Any]:
         record_id = str(record.get("id") or self._record_id("backtest_run", record))

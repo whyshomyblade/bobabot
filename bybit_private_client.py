@@ -17,18 +17,22 @@ class BybitPrivateAPIError(RuntimeError):
 
 
 class BybitPrivateClient:
-    def __init__(self) -> None:
-        self.api_key = config.BYBIT_API_KEY
-        self.api_secret = config.BYBIT_API_SECRET
-        self.testnet = config.BYBIT_TESTNET
+    def __init__(self, storage: Any | None = None) -> None:
+        self.api_key = ""
+        self.api_secret = ""
+        self.testnet = True
         self.trading_enabled = config.BYBIT_TRADING_ENABLED
-        self.base_url = "https://api-testnet.bybit.com" if self.testnet else config.BYBIT_BASE_URL
+        self.credential_source = "NONE"
+        self.masked_key = ""
+        self.base_url = "https://api-testnet.bybit.com"
         self.recv_window = "5000"
         self.session = requests.Session()
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.load_credentials(storage)
 
         mode = self.mode_label()
         self.logger.info("Execution assistant started in %s mode", mode)
+        self.logger.info("Bybit API credential source: %s", self.credential_source)
         if not self.has_api_keys:
             self.logger.warning("Bybit API keys are not configured; private trading actions are disabled")
         if config.HOSTING_MODE and not self.trading_enabled:
@@ -53,11 +57,69 @@ class BybitPrivateClient:
             return "TESTNET"
         return "REAL"
 
+    def market_mode_label(self) -> str:
+        return "TESTNET" if self.testnet else "MAINNET"
+
+    def load_credentials(self, storage: Any | None = None) -> None:
+        env_key = config.BYBIT_API_KEY
+        env_secret = config.BYBIT_API_SECRET
+        if env_key and env_secret:
+            self.api_key = env_key
+            self.api_secret = env_secret
+            self.testnet = config.BYBIT_TESTNET
+            self.credential_source = "ENV"
+            self.masked_key = self._mask_key(env_key)
+        else:
+            credential = storage.get_active_api_credentials() if storage is not None else None
+            if credential:
+                self.api_key = str(credential.get("api_key") or "")
+                self.api_secret = str(credential.get("api_secret") or "")
+                self.testnet = str(credential.get("mode") or "TESTNET").upper() != "MAINNET"
+                self.credential_source = "TELEGRAM_DB"
+                self.masked_key = str(credential.get("masked_key") or self._mask_key(self.api_key))
+            else:
+                self.api_key = ""
+                self.api_secret = ""
+                self.testnet = config.BYBIT_TESTNET
+                self.credential_source = "NONE"
+                self.masked_key = ""
+
+        self.trading_enabled = config.BYBIT_TRADING_ENABLED
+        self.base_url = "https://api-testnet.bybit.com" if self.testnet else config.BYBIT_BASE_URL
+        config.BYBIT_TESTNET = self.testnet
+        if self.credential_source in {"ENV", "TELEGRAM_DB"}:
+            config.BYBIT_API_KEY = self.api_key if self.credential_source == "ENV" else ""
+            config.BYBIT_API_SECRET = self.api_secret if self.credential_source == "ENV" else ""
+
+    def set_credentials(
+        self,
+        api_key: str,
+        api_secret: str,
+        mode: str = "TESTNET",
+        source: str = "TELEGRAM_DB",
+        masked_key: str | None = None,
+    ) -> None:
+        self.api_key = api_key.strip()
+        self.api_secret = api_secret.strip()
+        self.testnet = str(mode).upper() != "MAINNET"
+        self.credential_source = source
+        self.masked_key = masked_key or self._mask_key(self.api_key)
+        self.trading_enabled = config.BYBIT_TRADING_ENABLED
+        self.base_url = "https://api-testnet.bybit.com" if self.testnet else config.BYBIT_BASE_URL
+        config.BYBIT_TESTNET = self.testnet
+
+    def set_mode(self, mode: str) -> None:
+        self.testnet = str(mode).upper() != "MAINNET"
+        self.base_url = "https://api-testnet.bybit.com" if self.testnet else config.BYBIT_BASE_URL
+        config.BYBIT_TESTNET = self.testnet
+
     def reload_from_environment(self) -> None:
         self.api_key = os.getenv("BYBIT_API_KEY", "").strip()
         self.api_secret = os.getenv("BYBIT_API_SECRET", "").strip()
         self.testnet = os.getenv("BYBIT_TESTNET", "true").strip().lower() in {"1", "true", "yes", "on"}
         self.trading_enabled = os.getenv("BYBIT_TRADING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self.credential_source = "ENV" if self.api_key and self.api_secret else "NONE"
+        self.masked_key = self._mask_key(self.api_key) if self.api_key else ""
         self.base_url = "https://api-testnet.bybit.com" if self.testnet else config.BYBIT_BASE_URL
         config.BYBIT_API_KEY = self.api_key
         config.BYBIT_API_SECRET = self.api_secret
@@ -99,7 +161,9 @@ class BybitPrivateClient:
         qty: float | str,
         price: float | str,
         reduce_only: bool = False,
+        order_link_id: str | None = None,
     ) -> dict[str, Any]:
+        order_link_id = order_link_id or f"bobabot-{int(time.time() * 1000)}"
         if not self.trading_enabled:
             return {
                 "retCode": 0,
@@ -110,6 +174,7 @@ class BybitPrivateClient:
                     "side": side,
                     "qty": str(qty),
                     "price": str(price),
+                    "orderLinkId": order_link_id,
                 },
             }
         payload = {
@@ -121,6 +186,7 @@ class BybitPrivateClient:
             "price": str(price),
             "timeInForce": "GTC",
             "reduceOnly": reduce_only,
+            "orderLinkId": order_link_id,
         }
         return self._signed_request("POST", "/v5/order/create", payload)
 
@@ -186,7 +252,12 @@ class BybitPrivateClient:
         }
         return self._signed_request("POST", "/v5/order/create", payload)
 
-    def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        order_link_id: str | None = None,
+    ) -> dict[str, Any]:
         if not self.trading_enabled:
             return {
                 "retCode": 0,
@@ -195,16 +266,23 @@ class BybitPrivateClient:
                     "paper": True,
                     "symbol": symbol,
                     "orderId": order_id,
+                    "orderLinkId": order_link_id,
                 },
             }
+        payload = {
+            "category": "linear",
+            "symbol": symbol,
+        }
+        if order_id:
+            payload["orderId"] = order_id
+        if order_link_id:
+            payload["orderLinkId"] = order_link_id
+        if not order_id and not order_link_id:
+            raise BybitPrivateAPIError("order_id or order_link_id required")
         return self._signed_request(
             "POST",
             "/v5/order/cancel",
-            {
-                "category": "linear",
-                "symbol": symbol,
-                "orderId": order_id,
-            },
+            payload,
         )
 
     def get_instrument_info(self, symbol: str) -> dict[str, Any] | None:
@@ -323,3 +401,10 @@ class BybitPrivateClient:
                 time.sleep(sleep_for)
 
         raise BybitPrivateAPIError(f"Bybit private request failed after retries: {last_error}")
+
+    @staticmethod
+    def _mask_key(value: str) -> str:
+        text = str(value or "")
+        if len(text) <= 8:
+            return "****" if text else ""
+        return f"{text[:4]}********{text[-4:]}"

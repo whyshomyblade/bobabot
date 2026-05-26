@@ -216,6 +216,24 @@ class Storage:
     ) -> list[dict[str, Any]]:
         return self.database.get_paper_orders(statuses=statuses, limit=limit)
 
+    def save_api_credentials(
+        self,
+        api_key: str,
+        api_secret: str,
+        masked_key: str,
+        mode: str = "TESTNET",
+    ) -> dict[str, Any]:
+        return self.database.save_api_credentials(api_key, api_secret, masked_key, mode)
+
+    def get_active_api_credentials(self) -> dict[str, Any] | None:
+        return self.database.get_active_api_credentials()
+
+    def clear_api_credentials(self) -> None:
+        self.database.clear_api_credentials()
+
+    def update_active_api_mode(self, mode: str) -> dict[str, Any] | None:
+        return self.database.update_active_api_mode(mode)
+
     def add_backtest_run(self, record: dict[str, Any]) -> dict[str, Any]:
         return self.database.add_backtest_run(record)
 
