@@ -16,6 +16,12 @@ Mainnet real trading остаётся закрыт Real Trading Gate.
 Бот попросит отправить ключи одним сообщением:
 
 ```text
+API_KEY API_SECRET
+```
+
+Старый формат тоже поддерживается:
+
+```text
 API_KEY|API_SECRET
 ```
 

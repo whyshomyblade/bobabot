@@ -1036,7 +1036,7 @@ def api_help_text() -> str:
             "или кнопка:",
             "🔑 API → 🔐 Внести API ключи",
             "потом отправить:",
-            "API_KEY|API_SECRET",
+            "API_KEY API_SECRET",
             "",
             "Удалить ключи:",
             "/api_clear",
@@ -1060,6 +1060,12 @@ def api_set_prompt_text() -> str:
             "",
             "Отправь ключи одним сообщением в формате:",
             "",
+            "API_KEY API_SECRET",
+            "",
+            "Пример:",
+            "abcd123456 secret987654",
+            "",
+            "Можно и старым форматом:",
             "API_KEY|API_SECRET",
             "",
             "Сообщение с ключами бот попробует удалить.",
@@ -1089,7 +1095,7 @@ def handle_api_set_credentials(
 
     parsed = parse_api_credentials(text)
     if parsed is None:
-        send_with_keyboard(telegram, "Формат не распознан. Используй API_KEY|API_SECRET.", build_trading_api_menu_keyboard())
+        send_with_keyboard(telegram, "Формат не распознан. Используй API_KEY API_SECRET.", build_trading_api_menu_keyboard())
         return
     api_key, api_secret = parsed
     masked = mask_secret(api_key)
@@ -1148,10 +1154,19 @@ def api_mode_text(
 
 
 def parse_api_credentials(text: str) -> tuple[str, str] | None:
-    if "|" not in text:
+    cleaned = str(text or "").strip()
+    if not cleaned:
         return None
-    api_key, api_secret = (part.strip() for part in text.split("|", 1))
-    if len(api_key) < 8 or len(api_secret) < 16:
+
+    if "|" in cleaned:
+        parts = [part.strip() for part in cleaned.split("|")]
+    else:
+        parts = cleaned.split()
+
+    if len(parts) != 2:
+        return None
+    api_key, api_secret = parts
+    if len(api_key) < 8 or len(api_secret) < 8:
         return None
     if any(char.isspace() for char in api_key + api_secret):
         return None
