@@ -154,6 +154,29 @@ class BybitPrivateClient:
         rows = payload.get("result", {}).get("list", [])
         return rows if isinstance(rows, list) else []
 
+    def get_order_history(
+        self,
+        symbol: str | None = None,
+        order_id: str | None = None,
+        order_link_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "category": "linear",
+            "limit": str(limit),
+        }
+        if symbol:
+            params["symbol"] = symbol
+        else:
+            params["settleCoin"] = "USDT"
+        if order_id:
+            params["orderId"] = order_id
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        payload = self._signed_request("GET", "/v5/order/history", params)
+        rows = payload.get("result", {}).get("list", [])
+        return rows if isinstance(rows, list) else []
+
     def place_limit_order(
         self,
         symbol: str,
@@ -163,6 +186,7 @@ class BybitPrivateClient:
         reduce_only: bool = False,
         order_link_id: str | None = None,
     ) -> dict[str, Any]:
+        self._ensure_write_allowed()
         order_link_id = order_link_id or f"bobabot-{int(time.time() * 1000)}"
         if not self.trading_enabled:
             return {
@@ -197,6 +221,7 @@ class BybitPrivateClient:
         qty: float | str,
         stop_price: float | str,
     ) -> dict[str, Any]:
+        self._ensure_write_allowed()
         if not self.trading_enabled:
             return {
                 "retCode": 0,
@@ -228,6 +253,7 @@ class BybitPrivateClient:
         qty: float | str,
         take_profit_price: float | str,
     ) -> dict[str, Any]:
+        self._ensure_write_allowed()
         if not self.trading_enabled:
             return {
                 "retCode": 0,
@@ -258,6 +284,7 @@ class BybitPrivateClient:
         order_id: str | None = None,
         order_link_id: str | None = None,
     ) -> dict[str, Any]:
+        self._ensure_write_allowed()
         if not self.trading_enabled:
             return {
                 "retCode": 0,
@@ -285,6 +312,11 @@ class BybitPrivateClient:
             payload,
         )
 
+    def _ensure_write_allowed(self) -> None:
+        if not self.testnet and config.MAINNET_READ_ONLY_MODE:
+            self.logger.warning("Blocked MAINNET write endpoint in dry-run/read-only mode")
+            raise BybitPrivateAPIError("MAINNET_READ_ONLY_MODE=true; real write endpoints are blocked.")
+
     def get_instrument_info(self, symbol: str) -> dict[str, Any] | None:
         base_url = config.BYBIT_BASE_URL if not self.trading_enabled else self.base_url
         payload = self._public_get(
@@ -294,6 +326,20 @@ class BybitPrivateClient:
                 "symbol": symbol,
             },
             base_url=base_url,
+        )
+        rows = payload.get("result", {}).get("list", [])
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
+    def get_ticker(self, symbol: str) -> dict[str, Any] | None:
+        payload = self._public_get(
+            "/v5/market/tickers",
+            {
+                "category": "linear",
+                "symbol": symbol,
+            },
+            base_url=self.base_url,
         )
         rows = payload.get("result", {}).get("list", [])
         if isinstance(rows, list) and rows:

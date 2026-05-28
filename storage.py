@@ -15,6 +15,19 @@ from setup_tracker import (
 )
 
 
+ORDER_STATE_CACHE_STATUSES = [
+    "PLANNED",
+    "PAPER_CREATED",
+    "SUBMITTED",
+    "OPEN",
+    "PARTIALLY_FILLED",
+    "CANCEL_REQUESTED",
+    "FILLED",
+    "POSITION_OPENED",
+    "UNKNOWN",
+]
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -63,6 +76,11 @@ class Storage:
             "symbol_blacklist": list(config.SYMBOL_BLACKLIST),
             "last_daily_report_date": None,
             "REAL_TRADING_UNLOCKED": config.REAL_TRADING_UNLOCKED_DEFAULT,
+            "REAL_DRY_RUN_ENABLED": config.REAL_DRY_RUN_ENABLED,
+            "MAINNET_READ_ONLY_MODE": config.MAINNET_READ_ONLY_MODE,
+            "TESTNET_AUTOPILOT_ENABLED": config.TESTNET_AUTOPILOT_ENABLED,
+            "PANIC_MODE": False,
+            "RUNTIME_TRADING_DISABLED": False,
             "api_set_pending": False,
             "last_setup_tracking_ts": 0,
         }
@@ -78,7 +96,7 @@ class Storage:
         state["recent_alerts"] = self.database.get_alert_history(limit=config.RECENT_ALERTS_LIMIT)
         state["active_setups"] = self.database.get_active_setups()
         state["setup_journal"] = self.database.get_setup_journal(limit=config.SETUP_JOURNAL_MAX_RECORDS)
-        state["paper_orders"] = self.database.get_paper_orders(statuses=["PLANNED", "SUBMITTED", "FILLED"])
+        state["paper_orders"] = self.database.get_paper_orders(statuses=ORDER_STATE_CACHE_STATUSES)
         return state
 
     def save(self) -> None:
@@ -198,12 +216,12 @@ class Storage:
 
     def add_paper_order(self, record: dict[str, Any]) -> dict[str, Any]:
         saved = self.database.add_paper_order(record)
-        self.state["paper_orders"] = self.database.get_paper_orders(statuses=["PLANNED", "SUBMITTED", "FILLED"])
+        self.state["paper_orders"] = self.database.get_paper_orders(statuses=ORDER_STATE_CACHE_STATUSES)
         return saved
 
     def update_paper_order(self, order_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
         updated = self.database.update_paper_order(order_id, updates)
-        self.state["paper_orders"] = self.database.get_paper_orders(statuses=["PLANNED", "SUBMITTED", "FILLED"])
+        self.state["paper_orders"] = self.database.get_paper_orders(statuses=ORDER_STATE_CACHE_STATUSES)
         return updated
 
     def get_paper_order(self, order_id: str) -> dict[str, Any] | None:
@@ -233,6 +251,12 @@ class Storage:
 
     def update_active_api_mode(self, mode: str) -> dict[str, Any] | None:
         return self.database.update_active_api_mode(mode)
+
+    def add_autopilot_decision(self, record: dict[str, Any]) -> dict[str, Any]:
+        return self.database.add_autopilot_decision(record)
+
+    def get_autopilot_decisions(self, limit: int | None = None) -> list[dict[str, Any]]:
+        return self.database.get_autopilot_decisions(limit=limit)
 
     def add_backtest_run(self, record: dict[str, Any]) -> dict[str, Any]:
         return self.database.add_backtest_run(record)

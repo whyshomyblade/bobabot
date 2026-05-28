@@ -13,6 +13,7 @@ class BotDatabase:
         self.path = Path(path)
         self.logger = logging.getLogger(self.__class__.__name__)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._backup_before_phase8_5_schema()
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self._init_schema()
@@ -135,9 +136,73 @@ class BotDatabase:
                 )
                 """
             )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autopilot_decisions (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    symbol TEXT,
+                    side TEXT,
+                    alert_type TEXT,
+                    risk_level TEXT,
+                    execution_quality TEXT,
+                    decision TEXT,
+                    reason TEXT,
+                    order_id TEXT,
+                    setup_id TEXT,
+                    mode TEXT,
+                    data TEXT NOT NULL
+                )
+                """
+            )
+            self._ensure_paper_order_columns()
 
     def close(self) -> None:
         self.connection.close()
+
+    def _backup_before_phase8_5_schema(self) -> Path | None:
+        if not self.path.exists():
+            return None
+        if any(self.path.parent.glob("backup_before_phase8_5_*.db")):
+            return None
+
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        backup_path = self.path.with_name(f"backup_before_phase8_5_{timestamp}.db")
+        shutil.copy2(self.path, backup_path)
+        self.logger.info("Created Phase 8.5 DB backup: %s", backup_path)
+        return backup_path
+
+    def _ensure_paper_order_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(paper_orders)").fetchall()
+        }
+        migrations = {
+            "exchange_order_id": "TEXT",
+            "order_link_id": "TEXT",
+            "entry_price": "REAL",
+            "stop_price": "REAL",
+            "tp1": "REAL",
+            "tp2": "REAL",
+            "qty": "TEXT",
+            "position_size_usdt": "REAL",
+            "risk_usdt": "REAL",
+            "submitted_at": "TEXT",
+            "filled_at": "TEXT",
+            "cancelled_at": "TEXT",
+            "closed_at": "TEXT",
+            "last_sync_at": "TEXT",
+            "raw_response_json": "TEXT",
+            "last_error": "TEXT",
+            "notes": "TEXT",
+        }
+        for name, column_type in migrations.items():
+            if name in columns:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE paper_orders ADD COLUMN {name} {column_type}"
+            )
+            self.logger.info("Added paper_orders.%s column", name)
 
     def get_runtime_state(self, key: str, default: Any = None) -> Any:
         row = self.connection.execute(
@@ -329,6 +394,7 @@ class BotDatabase:
                     record.get("updated_at"),
                 ),
             )
+            self._sync_paper_order_columns(record_id, record)
         return record
 
     def update_paper_order(self, order_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
@@ -355,7 +421,56 @@ class BotDatabase:
                     order_id,
                 ),
             )
+            self._sync_paper_order_columns(order_id, record)
         return record
+
+    def _sync_paper_order_columns(self, order_id: str, record: dict[str, Any]) -> None:
+        self.connection.execute(
+            """
+            UPDATE paper_orders
+            SET
+                exchange_order_id = ?,
+                order_link_id = ?,
+                entry_price = ?,
+                stop_price = ?,
+                tp1 = ?,
+                tp2 = ?,
+                qty = ?,
+                position_size_usdt = ?,
+                risk_usdt = ?,
+                submitted_at = ?,
+                filled_at = ?,
+                cancelled_at = ?,
+                closed_at = ?,
+                last_sync_at = ?,
+                raw_response_json = ?,
+                last_error = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (
+                record.get("exchange_order_id"),
+                record.get("order_link_id"),
+                self._optional_float(record.get("entry_price")),
+                self._optional_float(record.get("stop_price")),
+                self._optional_float(record.get("tp1")),
+                self._optional_float(record.get("tp2")),
+                None if record.get("qty") is None else str(record.get("qty")),
+                self._optional_float(record.get("position_size_usdt")),
+                self._optional_float(record.get("risk_usdt")),
+                record.get("submitted_at"),
+                record.get("filled_at"),
+                record.get("cancelled_at"),
+                record.get("closed_at"),
+                record.get("last_sync_at"),
+                self._dumps(record.get("raw_response_json") or record.get("exchange_response"))
+                if record.get("raw_response_json") is not None or record.get("exchange_response") is not None
+                else None,
+                record.get("last_error") or record.get("reject_reason"),
+                self._dumps(record.get("notes", [])) if record.get("notes") is not None else None,
+                order_id,
+            ),
+        )
 
     def get_paper_order(self, order_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -389,6 +504,53 @@ class BotDatabase:
 
     def count_paper_orders(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0])
+
+    def add_autopilot_decision(self, record: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(record.get("id") or f"auto_dec_{uuid.uuid4().hex}")
+        created_at = str(record.get("created_at") or self._now())
+        record["id"] = record_id
+        record["created_at"] = created_at
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO autopilot_decisions
+                    (id, created_at, symbol, side, alert_type, risk_level,
+                     execution_quality, decision, reason, order_id, setup_id, mode, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    created_at,
+                    record.get("symbol"),
+                    record.get("side"),
+                    record.get("alert_type"),
+                    record.get("risk_level"),
+                    record.get("execution_quality"),
+                    record.get("decision"),
+                    record.get("reason"),
+                    record.get("order_id"),
+                    record.get("setup_id"),
+                    record.get("mode"),
+                    self._dumps(record),
+                ),
+            )
+        return record
+
+    def get_autopilot_decisions(
+        self,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT data FROM autopilot_decisions ORDER BY rowid DESC"
+        params: list[Any] = []
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.connection.execute(query, tuple(params)).fetchall()
+        records = [self._loads(row["data"], {}) for row in rows]
+        return [record for record in records if isinstance(record, dict)]
+
+    def count_autopilot_decisions(self) -> int:
+        return int(self.connection.execute("SELECT COUNT(*) FROM autopilot_decisions").fetchone()[0])
 
     def save_api_credentials(
         self,
@@ -669,6 +831,14 @@ class BotDatabase:
             return json.loads(value)
         except (TypeError, json.JSONDecodeError):
             return default
+
+    def _optional_float(self, value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()

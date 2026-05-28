@@ -2,6 +2,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import signal
 import time
 import uuid
@@ -21,6 +22,12 @@ from backtester import (
 from bybit_client import BybitClient
 from bybit_private_client import BybitPrivateClient
 from health_server import start_health_server
+from order_lifecycle import (
+    build_order_lifecycle_keyboard,
+    format_order_status,
+    format_order_sync_summary,
+    sync_testnet_orders,
+)
 from performance_analyzer import (
     JOURNAL_EXPORT_FIELDS,
     ORDERS_EXPORT_FIELDS,
@@ -42,6 +49,14 @@ from setup_tracker import (
     normalize_final_state,
 )
 from storage import Storage
+from testnet_autopilot import (
+    TestnetAutopilot,
+    autopilot_block_reasons,
+    autopilot_enabled,
+    autopilot_journal_text,
+    autopilot_rules_text,
+    autopilot_status_text,
+)
 from telegram_client import (
     TelegramClient,
     build_main_inline_menu_keyboard,
@@ -55,7 +70,10 @@ from telegram_client import (
     build_setups_menu_keyboard,
     build_setups_trading_menu_keyboard,
     build_trading_api_menu_keyboard,
+    build_trading_autopilot_menu_keyboard,
+    build_trading_emergency_menu_keyboard,
     build_trading_orders_menu_keyboard,
+    build_trading_risk_menu_keyboard,
     build_trading_real_menu_keyboard,
 )
 
@@ -92,10 +110,25 @@ BUTTON_COMMANDS = {
     "🔁 API Mode Mainnet": "/api_mode mainnet",
     "🔄 API Reload": "/api_reload",
     "🐺 Real Status": "/real_status",
+    "🧪 Dry Run Status": "/dry_run_status",
+    "🔍 Mainnet Check": "/mainnet_check",
+    "🧮 Dry Run Order Help": "/dry_run_order help",
     "🔓 Enable Real": "/enable_real",
     "🔒 Disable Real": "/disable_real",
     "🚨 Panic": "/panic",
+    "✅ Panic Off": "/panic_off",
+    "🔒 Disable Trading": "/disable_trading",
+    "🧪 Enable Testnet Trading": "/enable_testnet_trading",
+    "🛡 Safety Status": "/safety_status",
+    "🤖 Status": "/autopilot_status",
+    "▶️ Enable TESTNET Autopilot": "/autopilot_on",
+    "⏸ Disable Autopilot": "/autopilot_off",
+    "📜 Rules": "/autopilot_rules",
+    "📒 Journal": "/autopilot_journal",
+    "🔄 Sync Orders": "/sync_orders",
+    "❌ Cancel All": "/cancel_all",
     "🚫 Cancel All TESTNET": "/cancel_all_testnet",
+    "❌ Cancel All TESTNET": "/cancel_all_testnet",
     "📤 Экспорт журнала": "/export_journal",
     "📤 Экспорт статистики": "/export_stats",
     "📤 Экспорт ордеров": "/export_orders",
@@ -146,6 +179,7 @@ def debug_state_text(storage: Storage) -> str:
             f"Записей журнала: {storage.database.count_setup_journal()}",
             f"История алертов: {storage.database.count_alert_history()}",
             f"Paper/orders records: {storage.database.count_paper_orders()}",
+            f"Autopilot decisions: {storage.database.count_autopilot_decisions()}",
             f"Backtest trades: {storage.database.count_backtest_trades()}",
             f"Последний скан: {storage.state.get('last_scan_time') or 'never'}",
             f"Hosting mode: {'ON' if config.HOSTING_MODE else 'OFF'}",
@@ -230,6 +264,26 @@ def config_text() -> str:
             f"• Real unlock min win rate: {config.REAL_MODE_UNLOCK_MIN_WIN_RATE:g}%",
             f"• Real unlock min Net R: {config.REAL_MODE_UNLOCK_MIN_NET_R:g}R",
             f"• Real requires realistic only: {str(config.REAL_MODE_REQUIRE_REALISTIC_ONLY).lower()}",
+            f"• Real dry run: {str(config.REAL_DRY_RUN_ENABLED).lower()}",
+            f"• Mainnet read-only: {str(config.MAINNET_READ_ONLY_MODE).lower()}",
+            f"• Auto place TP/SL: {str(config.AUTO_PLACE_TP_SL).lower()}",
+            "",
+            "TESTNET Autopilot:",
+            f"• Autopilot default: {str(config.TESTNET_AUTOPILOT_ENABLED).lower()}",
+            f"• Require realistic: {str(config.TESTNET_AUTOPILOT_REQUIRE_REALISTIC).lower()}",
+            f"• Allow HIGH risk: {str(config.TESTNET_AUTOPILOT_ALLOW_HIGH_RISK).lower()}",
+            f"• Allow FAST_MOVE: {str(config.TESTNET_AUTOPILOT_ALLOW_FAST_MOVE).lower()}",
+            f"• Allow AMBIGUOUS: {str(config.TESTNET_AUTOPILOT_ALLOW_AMBIGUOUS).lower()}",
+            f"• Max orders/day: {config.TESTNET_AUTOPILOT_MAX_ORDERS_PER_DAY}",
+            f"• Max active orders: {config.TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS}",
+            f"• Min R/R: {config.TESTNET_AUTOPILOT_MIN_RR:g}",
+            "",
+            "Order Lifecycle:",
+            f"• Order sync: {'ON' if config.ORDER_SYNC_ENABLED else 'OFF'}",
+            f"• Sync interval: {config.ORDER_SYNC_INTERVAL_SECONDS} sec",
+            f"• Max order lifetime: {config.ORDER_MAX_LIFETIME_MINUTES} min",
+            f"• Auto cancel expired: {str(config.AUTO_CANCEL_EXPIRED_ORDERS).lower()}",
+            f"• Auto cancel invalidated: {str(config.AUTO_CANCEL_INVALIDATED_BEFORE_FILL).lower()}",
             f"• Auto place TP/SL: {str(config.AUTO_PLACE_TP_SL).lower()}",
             "",
             "Analytics:",
@@ -420,7 +474,7 @@ def dispatch_command(
         backup_path = storage.backup_database()
         send_with_keyboard(telegram, f"✅ Бэкап базы создан: {backup_path}", build_settings_menu_keyboard())
     elif command == "/orders":
-        send_with_keyboard(telegram, orders_text(storage, private_client), build_setups_menu_keyboard())
+        send_with_keyboard(telegram, orders_text(storage, private_client), build_trading_orders_menu_keyboard())
     elif command == "/positions":
         send_with_keyboard(telegram, positions_text(private_client), build_setups_menu_keyboard())
     elif command == "/balance":
@@ -446,6 +500,12 @@ def dispatch_command(
         send_with_keyboard(telegram, api_reload_text(storage, private_client), build_setups_trading_menu_keyboard())
     elif command == "/real_status":
         send_with_keyboard(telegram, real_status_text(storage, private_client), build_setups_trading_menu_keyboard())
+    elif command == "/dry_run_status":
+        send_with_keyboard(telegram, dry_run_status_text(storage, private_client), build_trading_real_menu_keyboard())
+    elif command == "/mainnet_check":
+        send_with_keyboard(telegram, mainnet_check_text(storage, private_client), build_trading_real_menu_keyboard())
+    elif command == "/dry_run_order":
+        send_with_keyboard(telegram, dry_run_order_text(storage, private_client, args), build_trading_real_menu_keyboard())
     elif command == "/enable_real":
         handle_enable_real(storage, telegram, private_client)
     elif command == "/disable_real":
@@ -454,10 +514,43 @@ def dispatch_command(
         send_with_keyboard(telegram, "Real trading disabled.", build_setups_trading_menu_keyboard())
     elif command == "/panic":
         handle_panic(storage, telegram, private_client)
+    elif command == "/panic_off":
+        handle_panic_off(storage, telegram)
+    elif command == "/disable_trading":
+        handle_disable_trading(storage, telegram)
+    elif command == "/enable_testnet_trading":
+        handle_enable_testnet_trading(storage, telegram, private_client)
+    elif command == "/safety_status":
+        send_with_keyboard(telegram, safety_status_text(storage, private_client), build_trading_emergency_menu_keyboard())
+    elif command == "/autopilot_status":
+        send_with_keyboard(telegram, autopilot_status_text(storage, private_client), build_trading_autopilot_menu_keyboard())
+    elif command == "/autopilot_on":
+        handle_autopilot_on(storage, telegram, private_client)
+    elif command == "/autopilot_off":
+        handle_autopilot_off(storage, telegram)
+    elif command == "/autopilot_rules":
+        send_with_keyboard(telegram, autopilot_rules_text(), build_trading_autopilot_menu_keyboard())
+    elif command == "/autopilot_journal":
+        send_with_keyboard(telegram, autopilot_journal_text(storage), build_trading_autopilot_menu_keyboard())
     elif command == "/cancel_order":
         send_with_keyboard(telegram, cancel_order_text(storage, private_client, args), build_setups_trading_menu_keyboard())
     elif command == "/cancel_all_testnet":
         handle_cancel_all_testnet_request(storage, telegram, private_client)
+    elif command == "/cancel_all":
+        handle_cancel_all_request(storage, telegram, private_client)
+    elif command == "/order_status":
+        target = args[0] if args else ""
+        if not target:
+            send_with_keyboard(telegram, "Использование: /order_status ORDER_ID", build_trading_orders_menu_keyboard())
+        else:
+            send_with_keyboard(
+                telegram,
+                format_order_status(storage, private_client, target),
+                build_trading_orders_menu_keyboard(),
+            )
+    elif command == "/sync_orders":
+        summary = sync_testnet_orders(private_client, storage, telegram=telegram, notify=False)
+        send_with_keyboard(telegram, format_order_sync_summary(summary), build_trading_orders_menu_keyboard())
     elif command == "/pause":
         storage.state["monitoring_enabled"] = False
         storage.save()
@@ -510,9 +603,15 @@ def handle_callback_query(
     elif data == "menu:setups_trading":
         edit_menu_message(telegram, message, "💰 Trading", build_setups_trading_menu_keyboard())
     elif data == "menu:trading_orders":
-        edit_menu_message(telegram, message, "📋 Orders", build_trading_orders_menu_keyboard())
+        edit_menu_message(telegram, message, "📋 Ордера", build_trading_orders_menu_keyboard())
     elif data == "menu:trading_api":
         edit_menu_message(telegram, message, "🔑 API", build_trading_api_menu_keyboard())
+    elif data == "menu:trading_risk":
+        edit_menu_message(telegram, message, "🛡 Risk", build_trading_risk_menu_keyboard())
+    elif data == "menu:trading_emergency":
+        edit_menu_message(telegram, message, "🚨 Emergency", build_trading_emergency_menu_keyboard())
+    elif data == "menu:trading_autopilot":
+        edit_menu_message(telegram, message, "🤖 Autopilot", build_trading_autopilot_menu_keyboard())
     elif data == "menu:trading_real":
         edit_menu_message(telegram, message, "🐺 Real Gate", build_trading_real_menu_keyboard())
     elif data == "menu:backtest_help":
@@ -554,9 +653,17 @@ def handle_callback_query(
     elif data == "real_unlock_cancel":
         send_with_keyboard(telegram, "❌ REAL unlock отменён.", build_setups_trading_menu_keyboard())
     elif data == "cancel_all_testnet_confirm":
-        send_with_keyboard(telegram, cancel_all_testnet_text(storage, private_client), build_setups_trading_menu_keyboard())
+        send_with_keyboard(telegram, cancel_all_testnet_text(storage, private_client), build_trading_emergency_menu_keyboard())
     elif data == "cancel_all_testnet_cancel":
-        send_with_keyboard(telegram, "❌ Отмена отмены TESTNET ордеров.", build_setups_trading_menu_keyboard())
+        send_with_keyboard(telegram, "❌ Отмена отмены TESTNET ордеров.", build_trading_emergency_menu_keyboard())
+    elif data == "cancel_all_mainnet_confirm":
+        send_with_keyboard(
+            telegram,
+            "⚠️ MAINNET cancel-all не реализован в этой фазе. Ордера не отменялись.",
+            build_trading_emergency_menu_keyboard(),
+        )
+    elif data == "cancel_all_mainnet_cancel":
+        send_with_keyboard(telegram, "❌ MAINNET cancel-all отменён.", build_trading_emergency_menu_keyboard())
     elif data == "api_set_cancel":
         storage.save_runtime_state("api_set_pending", False)
         send_with_keyboard(telegram, "❌ API setup отменён.", build_trading_api_menu_keyboard())
@@ -611,42 +718,59 @@ def api_status_text(storage: Storage, private_client: BybitPrivateClient) -> str
     place_order_status = "disabled"
     if config.BYBIT_TRADING_ENABLED and private_client.has_api_keys:
         place_order_status = "✅" if (private_client.testnet or real_unlocked) and connection_ok else "❌"
+        if not private_client.testnet and config.MAINNET_READ_ONLY_MODE:
+            place_order_status = "LOCKED"
+    mainnet_locked = not private_client.testnet and not real_unlocked
+    dry_run_on = dry_run_enabled(storage)
 
-    return "\n".join(
-        [
-            "🔑 Bybit API Status",
-            "",
-            f"Credential source: {private_client.credential_source}",
-            f"API key: {_found_label(bool(private_client.api_key))}",
-            f"API key masked: {private_client.masked_key or 'n/a'}",
-            f"API secret: {_found_label(bool(private_client.api_secret))}",
-            f"Mode: {private_client.market_mode_label()}",
-            f"Trading enabled env: {str(config.BYBIT_TRADING_ENABLED).lower()}",
-            f"Real trading unlocked: {str(real_unlocked).lower()}",
-            f"Effective real trading: {str(effective_real).lower()}",
-            "",
-            f"Connection: {'OK' if connection_ok else 'ERROR'}",
-            f"Balance: {'OK' if checks['balance_ok'] else 'ERROR'}",
-            f"Positions: {'OK' if checks['positions_ok'] else 'ERROR'}",
-            f"Orders: {'OK' if checks['orders_ok'] else 'ERROR'}",
-            "",
-            "Permissions:",
-            f"Read balance: {_ok_label(checks['balance_ok'])}",
-            f"Read positions: {_ok_label(checks['positions_ok'])}",
-            f"Read orders: {_ok_label(checks['orders_ok'])}",
-            f"Place order: {place_order_status}",
-            "",
-            "Safety:",
-            f"Real orders: {'ENABLED' if effective_real else 'LOCKED'}",
-            f"Paper mode: {'ON' if paper_mode else 'OFF'}",
-        ]
-        + (
+    lines = [
+        "🔑 Bybit API Status",
+        "",
+        f"Credential source: {private_client.credential_source}",
+        f"API key: {_found_label(bool(private_client.api_key))}",
+        f"API key masked: {private_client.masked_key or 'n/a'}",
+        f"API secret: {_found_label(bool(private_client.api_secret))}",
+        f"Mode: {private_client.market_mode_label()}",
+        f"Trading enabled env: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+        f"Real trading unlocked: {str(real_unlocked).lower()}",
+        f"Effective real trading: {str(effective_real).lower()}",
+        "",
+        f"Connection: {'OK' if connection_ok else 'ERROR'}",
+        f"Balance: {'OK' if checks['balance_ok'] else 'ERROR'}",
+        f"Positions: {'OK' if checks['positions_ok'] else 'ERROR'}",
+        f"Orders: {'OK' if checks['orders_ok'] else 'ERROR'}",
+        "",
+        "Permissions:",
+        f"Read balance: {_ok_label(checks['balance_ok'])}",
+        f"Read positions: {_ok_label(checks['positions_ok'])}",
+        f"Read orders: {_ok_label(checks['orders_ok'])}",
+        f"Place order: {place_order_status}",
+        "",
+        "Safety:",
+        f"Real orders: {'ENABLED' if effective_real else 'LOCKED'}",
+        f"Paper mode: {'ON' if paper_mode else 'OFF'}",
+    ]
+    if mainnet_locked:
+        lines.extend(
             [
                 "",
-                "⚠️ API secret хранится локально в базе. Это быстрый режим, не максимальная безопасность.",
+                "Mainnet Dry Run:",
+                f"Mainnet read: {'OK' if connection_ok else 'ERROR'}",
+                "Real order placement: LOCKED",
+                "Effective real trading: false",
+                f"Dry run: {'ON' if dry_run_on else 'OFF'}",
             ]
-            if private_client.credential_source == "TELEGRAM_DB"
-            else []
+        )
+
+    return "\n".join(
+        lines
+        + (
+        [
+            "",
+            "⚠️ API secret хранится локально в базе. Это быстрый режим, не максимальная безопасность.",
+        ]
+        if private_client.credential_source == "TELEGRAM_DB"
+        else []
         )
     )
 
@@ -675,6 +799,191 @@ def api_test_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     if config.BYBIT_TRADING_ENABLED and private_client.testnet:
         lines.extend(["", "Order validation: no order placed during /api_test."])
     return "\n".join(lines)
+
+
+def mainnet_check_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    logging.getLogger("DryRun").info("Mainnet dry-run check requested")
+    private_client.load_credentials(storage)
+    checks = run_private_api_checks(private_client)
+    read_ok = checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]
+    trade_permission = trade_permission_label(storage, private_client)
+    verdict = "READ-ONLY OK" if (not private_client.testnet and read_ok and dry_run_enabled(storage)) else "NOT READY"
+    lines = [
+        "🧪 Mainnet Dry Run Check",
+        "",
+        f"Mode: {private_client.market_mode_label()}",
+        f"Real trading: {'ENABLED' if effective_real_trading(storage, private_client) else 'LOCKED'}",
+        f"Read balance: {'OK' if checks['balance_ok'] else 'ERROR'}",
+        f"Read positions: {'OK' if checks['positions_ok'] else 'ERROR'}",
+        f"Read orders: {'OK' if checks['orders_ok'] else 'ERROR'}",
+        f"Trade permission: {trade_permission}",
+        f"Effective real trading: {str(effective_real_trading(storage, private_client)).lower()}",
+        "",
+        "Verdict:",
+        verdict,
+    ]
+    errors = [sanitize_error(value) for value in checks["errors"] if value]
+    if errors:
+        lines.extend(["", "Errors:"])
+        lines.extend(f"- {error}" for error in errors[:3])
+    return "\n".join(lines)
+
+
+def dry_run_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    checks = run_private_api_checks(private_client) if private_client.can_call_private else {
+        "balance_ok": False,
+        "positions_ok": False,
+        "orders_ok": False,
+        "errors": ["Bybit API keys не настроены."],
+    }
+    api_ok = checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]
+    block_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=True)
+    return "\n".join(
+        [
+            "🧪 Dry Run Status",
+            "",
+            f"Dry run enabled: {str(dry_run_enabled(storage)).lower()}",
+            f"Mainnet read-only mode: {str(mainnet_read_only_mode(storage)).lower()}",
+            f"Real locked: {str(not real_trading_unlocked(storage)).lower()}",
+            f"Env trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+            f"Mode: {safety_mode_label(private_client)}",
+            f"Panic mode: {'ON' if storage.get_runtime_state('PANIC_MODE', False) else 'OFF'}",
+            f"Risk status: {'blocked' if block_reasons else 'ok'}",
+            f"Block reason: {block_reasons[0] if block_reasons else 'none'}",
+            f"API status: {'OK' if api_ok else 'ERROR'}",
+        ]
+    )
+
+
+def dry_run_order_text(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    args: list[str],
+) -> str:
+    if not args or args[0].lower() == "help" or len(args) != 6:
+        return "\n".join(
+            [
+                "Использование: /dry_run_order SYMBOL SIDE ENTRY STOP TP1 TP2",
+                "Пример: /dry_run_order BTCUSDT LONG 100000 99000 101000 102000",
+                "",
+                "Это только расчёт. Ордер НЕ отправляется.",
+            ]
+        )
+
+    symbol = args[0].upper()
+    side = args[1].upper()
+    entry = _to_float(args[2])
+    stop = _to_float(args[3])
+    tp1 = _to_float(args[4])
+    tp2 = _to_float(args[5])
+    reject_reasons: list[str] = []
+    if side not in {"LONG", "SHORT"}:
+        reject_reasons.append("side must be LONG or SHORT")
+    if None in {entry, stop, tp1, tp2}:
+        reject_reasons.append("price parse error")
+
+    balance = config.PAPER_ACCOUNT_BALANCE_USDT
+    balance_source = "fallback"
+    if private_client.can_call_private:
+        try:
+            balance = extract_usdt_balance(private_client.get_account_balance())
+            balance_source = "mainnet/testnet API"
+        except Exception as exc:
+            reject_reasons.append(f"balance read failed: {sanitize_error(exc)}")
+
+    instrument_info = None
+    try:
+        instrument_info = private_client.get_instrument_info(symbol)
+    except Exception as exc:
+        reject_reasons.append(f"instrument info unavailable: {sanitize_error(exc)}")
+
+    qty = 0.0
+    position_size_usdt = 0.0
+    risk_usdt = balance * (config.ACCOUNT_RISK_PERCENT / 100)
+    rr_tp1 = 0.0
+    rr_tp2 = 0.0
+    max_loss_usdt = 0.0
+    tp1_profit_usdt = 0.0
+    tp2_profit_usdt = 0.0
+    stop_distance_percent = 0.0
+
+    if side in {"LONG", "SHORT"} and None not in {entry, stop, tp1, tp2} and entry and stop and tp1 and tp2:
+        if side == "LONG" and stop >= entry:
+            reject_reasons.append("LONG stop must be below entry")
+        if side == "SHORT" and stop <= entry:
+            reject_reasons.append("SHORT stop must be above entry")
+        stop_distance = abs(entry - stop)
+        stop_distance_percent = stop_distance / entry * 100 if entry > 0 else 0
+        if stop_distance <= 0 or stop_distance_percent <= 0:
+            reject_reasons.append("stop distance <= 0")
+        if stop_distance > 0 and stop_distance_percent > 0:
+            position_size_usdt = risk_usdt / (stop_distance_percent / 100)
+            if position_size_usdt > config.MAX_POSITION_USDT:
+                reject_reasons.append("position size выше MAX_POSITION_USDT")
+            if position_size_usdt < config.MIN_POSITION_USDT:
+                reject_reasons.append("position size ниже MIN_POSITION_USDT")
+            qty = _round_dry_run_qty(position_size_usdt / entry, instrument_info)
+            min_qty = _dry_run_min_qty(instrument_info)
+            if qty <= 0:
+                reject_reasons.append("qty <= 0")
+            if min_qty is not None and qty < min_qty:
+                reject_reasons.append(f"qty меньше minOrderQty ({min_qty:g})")
+            rr_tp1 = abs(tp1 - entry) / stop_distance
+            rr_tp2 = abs(tp2 - entry) / stop_distance
+            if rr_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
+                reject_reasons.append("R/R ниже минимального порога")
+            position_size_usdt = qty * entry
+            fee = position_size_usdt * config.BYBIT_TAKER_FEE_RATE * 2
+            slippage = position_size_usdt * (config.SLIPPAGE_PERCENT / 100)
+            max_loss_usdt = risk_usdt + fee + slippage
+            tp1_profit_usdt = _dry_run_profit_usdt(side, entry, tp1, position_size_usdt) - fee - slippage
+            tp2_profit_usdt = _dry_run_profit_usdt(side, entry, tp2, position_size_usdt) - fee - slippage
+
+    if not private_client.testnet and real_trading_unlocked(storage):
+        reject_reasons.append("real unlocked flag exists, but dry run never submits orders")
+
+    lines = [
+        "🧪 DRY RUN REAL ORDER",
+        "",
+        "This order was NOT sent.",
+        "",
+        f"Symbol: {symbol}",
+        f"Side: {side}",
+        f"Entry: {_dry_fmt(entry)}",
+        f"Stop: {_dry_fmt(stop)}",
+        f"TP1: {_dry_fmt(tp1)}",
+        f"TP2: {_dry_fmt(tp2)}",
+        f"Qty: {_dry_fmt(qty)}",
+        f"Position size: {position_size_usdt:.2f} USDT",
+        f"Risk: {config.ACCOUNT_RISK_PERCENT:g}% = {risk_usdt:.2f} USDT",
+        f"Balance source: {balance_source}",
+        f"Stop distance: {stop_distance_percent:.2f}%",
+        f"R/R: TP1 {rr_tp1:.2f}R | TP2 {rr_tp2:.2f}R",
+        f"Max loss estimate: {max_loss_usdt:.4f} USDT",
+        f"TP1 estimate: {tp1_profit_usdt:.4f} USDT",
+        f"TP2 estimate: {tp2_profit_usdt:.4f} USDT",
+        "",
+        "Reject reasons:",
+    ]
+    lines.extend(f"- {reason}" for reason in reject_reasons)
+    if not reject_reasons:
+        lines.append("- none; dry run only")
+    lines.extend(
+        [
+            "",
+            "Real order placement: LOCKED",
+            "No POST order endpoint was called.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def trade_permission_label(storage: Storage, private_client: BybitPrivateClient) -> str:
+    if mainnet_read_only_mode(storage) or not config.BYBIT_TRADING_ENABLED or not real_trading_unlocked(storage):
+        return "disabled"
+    if private_client.testnet:
+        return "testnet only"
+    return "unknown"
 
 
 def api_help_text() -> str:
@@ -933,6 +1242,11 @@ def handle_enable_real(
         logger.warning("Real unlock rejected: order lifecycle unstable")
         send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
         return
+    safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
+    if safety_reasons:
+        logger.warning("Real unlock rejected: safety control %s", "; ".join(safety_reasons))
+        send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
+        return
 
     send_with_keyboard(
         telegram,
@@ -963,6 +1277,9 @@ def handle_real_unlock_step1(
     private_client: BybitPrivateClient,
 ) -> None:
     if not real_gate_stats(storage)["requirements_met"]:
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+    if order_safety_block_reasons(storage, private_client, include_real_gate=False):
         telegram.send_message(REAL_LOCK_PHRASE)
         return
     telegram.send_message(
@@ -1001,6 +1318,11 @@ def handle_real_unlock_step2(
         logger.warning("Real unlock rejected at second confirmation: order lifecycle unstable")
         send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
         return
+    safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
+    if safety_reasons:
+        logger.warning("Real unlock rejected at second confirmation: safety control %s", "; ".join(safety_reasons))
+        send_with_keyboard(telegram, REAL_LOCK_PHRASE, build_setups_trading_menu_keyboard())
+        return
     storage.save_runtime_state("REAL_TRADING_UNLOCKED", True)
     logger.warning("Real unlock enabled")
     send_with_keyboard(
@@ -1015,21 +1337,132 @@ def handle_panic(
     telegram: TelegramClient,
     private_client: BybitPrivateClient,
 ) -> None:
-    logger = logging.getLogger("RealGate")
+    logger = logging.getLogger("EmergencyControl")
     storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
-    cancelled = 0
-    if private_client.has_api_keys:
-        try:
-            for order in private_client.get_open_orders():
-                symbol = order.get("symbol")
-                order_id = order.get("orderId")
-                if symbol and order_id:
-                    private_client.cancel_order(str(symbol), str(order_id))
-                    cancelled += 1
-        except Exception as exc:
-            logger.error("Panic cancel failed: %s", exc)
-    logger.warning("Panic mode triggered; cancelled_orders=%s", cancelled)
-    send_with_keyboard(telegram, "PANIC MODE: real trading locked.", build_setups_trading_menu_keyboard())
+    storage.save_runtime_state("PANIC_MODE", True)
+    cancel_result = cancel_all_testnet_now(storage, private_client)
+    logger.warning(
+        "Panic mode enabled; testnet_cancel_status=%s cancelled=%s",
+        cancel_result["status"],
+        cancel_result["cancelled"],
+    )
+    send_with_keyboard(
+        telegram,
+        "\n".join(
+            [
+                "🚨 PANIC MODE ENABLED",
+                "",
+                "Real trading: locked",
+                "New orders: blocked",
+                f"TESTNET cancel request: {cancel_result['status']}",
+                "Scanner: still monitoring",
+            ]
+        ),
+        build_trading_emergency_menu_keyboard(),
+    )
+
+
+def handle_panic_off(storage: Storage, telegram: TelegramClient) -> None:
+    storage.save_runtime_state("PANIC_MODE", False)
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+    logging.getLogger("EmergencyControl").warning("Panic mode disabled; real trading remains locked")
+    send_with_keyboard(
+        telegram,
+        "✅ PANIC MODE disabled.\nReal trading remains locked.",
+        build_trading_emergency_menu_keyboard(),
+    )
+
+
+def handle_disable_trading(storage: Storage, telegram: TelegramClient) -> None:
+    storage.save_runtime_state("RUNTIME_TRADING_DISABLED", True)
+    logging.getLogger("EmergencyControl").warning("Runtime trading disabled")
+    send_with_keyboard(
+        telegram,
+        "🔒 Trading disabled.\nScanner continues.",
+        build_trading_emergency_menu_keyboard(),
+    )
+
+
+def handle_enable_testnet_trading(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    if not private_client.testnet:
+        send_with_keyboard(
+            telegram,
+            "❌ TESTNET trading не включён: текущий API mode MAINNET. Сначала /api_mode testnet.",
+            build_trading_emergency_menu_keyboard(),
+        )
+        return
+    storage.save_runtime_state("RUNTIME_TRADING_DISABLED", False)
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+    logging.getLogger("EmergencyControl").warning("Testnet/paper trading enabled; real remains locked")
+    send_with_keyboard(
+        telegram,
+        "🧪 TESTNET trading enabled.\nReal trading remains locked.",
+        build_trading_emergency_menu_keyboard(),
+    )
+
+
+def handle_autopilot_on(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("TestnetAutopilot")
+    if not private_client.testnet:
+        logger.warning("Autopilot enable rejected: mode MAINNET")
+        if config.BYBIT_TRADING_ENABLED and not real_trading_unlocked(storage):
+            telegram.send_message(REAL_LOCK_PHRASE)
+            return
+        send_with_keyboard(
+            telegram,
+            "TESTNET Autopilot works only in TESTNET mode.",
+            build_trading_autopilot_menu_keyboard(),
+        )
+        return
+    if not config.BYBIT_TRADING_ENABLED:
+        send_with_keyboard(
+            telegram,
+            "❌ TESTNET Autopilot не включён: BYBIT_TRADING_ENABLED=false.",
+            build_trading_autopilot_menu_keyboard(),
+        )
+        return
+    if not private_client.has_api_keys:
+        send_with_keyboard(
+            telegram,
+            "❌ TESTNET Autopilot не включён: Bybit API keys не настроены.",
+            build_trading_autopilot_menu_keyboard(),
+        )
+        return
+    checks = run_private_api_checks(private_client)
+    if not (checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]):
+        logger.warning("Autopilot enable rejected: API test failed")
+        send_with_keyboard(
+            telegram,
+            "❌ TESTNET Autopilot не включён: API test failed.",
+            build_trading_autopilot_menu_keyboard(),
+        )
+        return
+    storage.save_runtime_state("TESTNET_AUTOPILOT_ENABLED", True)
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+    logger.warning("TESTNET Autopilot enabled")
+    send_with_keyboard(
+        telegram,
+        "🧪 TESTNET Autopilot enabled.\nReal trading remains locked.",
+        build_trading_autopilot_menu_keyboard(),
+    )
+
+
+def handle_autopilot_off(storage: Storage, telegram: TelegramClient) -> None:
+    storage.save_runtime_state("TESTNET_AUTOPILOT_ENABLED", False)
+    logging.getLogger("TestnetAutopilot").warning("TESTNET Autopilot disabled")
+    send_with_keyboard(
+        telegram,
+        "⏸ TESTNET Autopilot disabled.",
+        build_trading_autopilot_menu_keyboard(),
+    )
 
 
 def run_private_api_checks(private_client: BybitPrivateClient) -> dict[str, Any]:
@@ -1069,9 +1502,95 @@ def effective_real_trading(storage: Storage, private_client: BybitPrivateClient)
     return (
         config.BYBIT_TRADING_ENABLED
         and not config.BYBIT_TESTNET
+        and not mainnet_read_only_mode(storage)
         and private_client.has_api_keys
         and real_trading_unlocked(storage)
     )
+
+
+def dry_run_enabled(storage: Storage) -> bool:
+    return bool(storage.get_runtime_state("REAL_DRY_RUN_ENABLED", config.REAL_DRY_RUN_ENABLED))
+
+
+def mainnet_read_only_mode(storage: Storage) -> bool:
+    return bool(storage.get_runtime_state("MAINNET_READ_ONLY_MODE", config.MAINNET_READ_ONLY_MODE))
+
+
+def order_safety_block_reasons(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    include_real_gate: bool = True,
+) -> list[str]:
+    reasons = []
+    if storage.get_runtime_state("PANIC_MODE", False):
+        reasons.append("PANIC_MODE=true")
+    if storage.get_runtime_state("RUNTIME_TRADING_DISABLED", False):
+        reasons.append("runtime trading disabled")
+    if storage.get_runtime_state("daily_loss_limit_reached", False):
+        reasons.append("daily loss limit reached")
+    if storage.get_runtime_state("order_lifecycle_unstable", False):
+        reasons.append("order lifecycle unstable")
+    if config.BYBIT_TRADING_ENABLED and not private_client.has_api_keys:
+        reasons.append("Bybit API keys не настроены.")
+    if include_real_gate and config.BYBIT_TRADING_ENABLED and not private_client.testnet and not real_trading_unlocked(storage):
+        reasons.append("REAL_TRADING_UNLOCKED=false")
+    return reasons
+
+
+def order_safety_block_text(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    reasons: list[str],
+) -> str:
+    mode = safety_mode_label(private_client)
+    return "\n".join(
+        [
+            "❌ Ордер заблокирован Safety Control",
+            "",
+            f"Причина: {reasons[0] if reasons else 'unknown'}",
+            f"Mode: {mode}",
+            f"Real locked: {str(not real_trading_unlocked(storage)).lower()}",
+            f"Panic mode: {str(bool(storage.get_runtime_state('PANIC_MODE', False))).lower()}",
+        ]
+    )
+
+
+def safety_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    panic = bool(storage.get_runtime_state("PANIC_MODE", False))
+    runtime_disabled = bool(storage.get_runtime_state("RUNTIME_TRADING_DISABLED", False))
+    real_unlocked = real_trading_unlocked(storage)
+    block_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=True)
+    api_ok = False
+    if private_client.can_call_private:
+        checks = run_private_api_checks(private_client)
+        api_ok = checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]
+    daily_loss_lock = bool(storage.get_runtime_state("daily_loss_limit_reached", False))
+    mode = safety_mode_label(private_client)
+    allowed = not block_reasons
+    reason = block_reasons[0] if block_reasons else "none"
+    return "\n".join(
+        [
+            "🛡 Safety Status",
+            "",
+            f"Panic mode: {'ON' if panic else 'OFF'}",
+            f"Runtime trading disabled: {str(runtime_disabled).lower()}",
+            f"Real trading unlocked: {str(real_unlocked).lower()}",
+            f"BYBIT_TRADING_ENABLED env: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+            f"Mode: {mode}",
+            f"New orders allowed: {'yes' if allowed else 'no'}",
+            f"Reason if blocked: {reason}",
+            "",
+            "Risk control: active",
+            f"Daily loss lock: {'yes' if daily_loss_lock else 'no'}",
+            f"API status: {'OK' if api_ok else 'ERROR'}",
+        ]
+    )
+
+
+def safety_mode_label(private_client: BybitPrivateClient) -> str:
+    if not config.BYBIT_TRADING_ENABLED:
+        return "PAPER"
+    return "TESTNET" if private_client.testnet else "MAINNET"
 
 
 def real_gate_stats(storage: Storage) -> dict[str, Any]:
@@ -1117,11 +1636,13 @@ def real_order_safety_rejections(
     private_client: BybitPrivateClient,
     plan: dict[str, Any],
 ) -> list[str]:
-    reasons = []
+    reasons = order_safety_block_reasons(storage, private_client, include_real_gate=True)
     if not config.BYBIT_TRADING_ENABLED:
         reasons.append("BYBIT_TRADING_ENABLED=false")
     if config.BYBIT_TESTNET:
         reasons.append("BYBIT_TESTNET=true")
+    if not private_client.testnet and mainnet_read_only_mode(storage):
+        reasons.append("MAINNET_READ_ONLY_MODE=true")
     if not real_trading_unlocked(storage):
         reasons.append("REAL_TRADING_UNLOCKED=false")
     if not private_client.has_api_keys:
@@ -1162,7 +1683,7 @@ def testnet_order_safety_rejections(
     private_client: BybitPrivateClient,
     plan: dict[str, Any],
 ) -> list[str]:
-    reasons = []
+    reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
     if not private_client.has_api_keys:
         reasons.append("Bybit API keys не настроены.")
     if not private_client.testnet:
@@ -1265,6 +1786,16 @@ def calculate_order_plan(
     private_client: BybitPrivateClient,
 ) -> None:
     logger = logging.getLogger("ExecutionAssistant")
+    safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
+    if safety_reasons:
+        logger.warning("Order calculation blocked by safety control: %s", "; ".join(safety_reasons))
+        send_with_keyboard(
+            telegram,
+            order_safety_block_text(storage, private_client, safety_reasons),
+            build_trading_emergency_menu_keyboard(),
+        )
+        return
+
     if config.BYBIT_TRADING_ENABLED and not private_client.has_api_keys:
         send_with_keyboard(telegram, "Bybit API keys не настроены.", build_main_menu_keyboard())
         return
@@ -1346,12 +1877,23 @@ def submit_order_plan(
         send_with_keyboard(telegram, f"❌ План уже имеет статус: {plan.get('status')}", build_main_menu_keyboard())
         return
 
+    safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
+    if safety_reasons:
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(safety_reasons)})
+        logger.warning("Order blocked by safety control symbol=%s reason=%s", plan.get("symbol"), "; ".join(safety_reasons))
+        send_with_keyboard(
+            telegram,
+            order_safety_block_text(storage, private_client, safety_reasons),
+            build_trading_emergency_menu_keyboard(),
+        )
+        return
+
     if config.BYBIT_TRADING_ENABLED and not private_client.has_api_keys:
         send_with_keyboard(telegram, "Bybit API keys не настроены.", build_main_menu_keyboard())
         return
 
     if not config.BYBIT_TRADING_ENABLED:
-        updated = storage.update_paper_order(plan_id, {"status": "SUBMITTED", "mode": "PAPER"})
+        updated = storage.update_paper_order(plan_id, {"status": "PAPER_CREATED", "mode": "PAPER"})
         logger.info(
             "Order mode PAPER: submitted symbol=%s side=%s setup_id=%s execution_status=%s risk=%s",
             plan.get("symbol"),
@@ -1379,6 +1921,11 @@ def submit_order_plan(
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "REAL_TRADING_UNLOCKED=false"})
         logger.warning("Order rejected reason=real locked symbol=%s setup_id=%s", plan.get("symbol"), plan.get("source_setup_id"))
         telegram.send_message(REAL_LOCK_PHRASE)
+        send_with_keyboard(
+            telegram,
+            "Real trading locked.\nUse /real_status.",
+            build_trading_real_menu_keyboard(),
+        )
         return
 
     if config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and real_trading_unlocked(storage):
@@ -1433,6 +1980,7 @@ def submit_order_plan(
                 "status": "SUBMITTED",
                 "mode": private_client.mode_label(),
                 "exchange_order_id": result.get("orderId"),
+                "submitted_at": datetime.now(UTC).isoformat(),
                 "exchange_response": response,
             },
         )
@@ -1453,7 +2001,7 @@ def submit_order_plan(
                     f"Order ID: {result.get('orderId', 'n/a')}",
                 ]
             ),
-            build_main_menu_keyboard(),
+            build_order_lifecycle_keyboard(plan_id),
         )
     except Exception as exc:
         logger.error("Order submit failed symbol=%s error=%s", plan.get("symbol"), exc)
@@ -1477,6 +2025,17 @@ def submit_testnet_order_after_confirmation(
         return
     if not (config.BYBIT_TRADING_ENABLED and config.BYBIT_TESTNET):
         send_with_keyboard(telegram, "❌ TESTNET ордер отклонён\n\nПричина: режим не TESTNET.", build_main_menu_keyboard())
+        return
+
+    safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
+    if safety_reasons:
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(safety_reasons)})
+        logger.warning("Testnet order blocked by safety control symbol=%s reason=%s", plan.get("symbol"), "; ".join(safety_reasons))
+        send_with_keyboard(
+            telegram,
+            order_safety_block_text(storage, private_client, safety_reasons),
+            build_trading_emergency_menu_keyboard(),
+        )
         return
 
     reasons = testnet_order_safety_rejections(storage, private_client, plan)
@@ -1504,6 +2063,7 @@ def submit_testnet_order_after_confirmation(
                 "mode": "TESTNET",
                 "order_link_id": order_link_id,
                 "exchange_order_id": result.get("orderId"),
+                "submitted_at": datetime.now(UTC).isoformat(),
                 "raw_response_json": response,
                 "exchange_response": response,
             },
@@ -1525,10 +2085,10 @@ def submit_testnet_order_after_confirmation(
                     f"Order Link ID: {order_link_id}",
                     "",
                     "⚠️ TP/SL пока не выставляются автоматически.",
-                    "Это будет отдельная фаза Order Lifecycle Manager.",
+                    "Lifecycle Manager будет отслеживать статус ордера.",
                 ]
             ),
-            build_main_menu_keyboard(),
+            build_order_lifecycle_keyboard(plan_id),
         )
     except Exception as exc:
         reason = sanitize_error(exc)
@@ -1551,9 +2111,24 @@ def submit_real_order_after_confirmation(
     if plan.get("status") != "PLANNED":
         send_with_keyboard(telegram, f"❌ План уже имеет статус: {plan.get('status')}", build_main_menu_keyboard())
         return
+    safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
+    if safety_reasons:
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(safety_reasons)})
+        logger.warning("Real order blocked by safety control symbol=%s reason=%s", plan.get("symbol"), "; ".join(safety_reasons))
+        send_with_keyboard(
+            telegram,
+            order_safety_block_text(storage, private_client, safety_reasons),
+            build_trading_emergency_menu_keyboard(),
+        )
+        return
     if not (config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and real_trading_unlocked(storage)):
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "real gate closed"})
         telegram.send_message(REAL_LOCK_PHRASE)
+        send_with_keyboard(
+            telegram,
+            "Real trading locked.\nUse /real_status.",
+            build_trading_real_menu_keyboard(),
+        )
         return
 
     reasons = real_order_safety_rejections(storage, private_client, plan)
@@ -1830,19 +2405,38 @@ def cancel_order_text(
             return f"❌ Не удалось найти/отменить ордер: {sanitize_error(exc)}"
         return "❌ Ордер не найден в локальной базе или открытых Bybit ордерах."
     if order.get("mode") not in {"TESTNET", "REAL"}:
-        storage.update_paper_order(str(order.get("id")), {"status": "CANCELLED"})
+        storage.update_paper_order(
+            str(order.get("id")),
+            {
+                "status": "CANCELLED",
+                "cancelled_at": datetime.now(UTC).isoformat(),
+                "closed_at": datetime.now(UTC).isoformat(),
+            },
+        )
         return "✅ Локальный paper order отменён."
     if order.get("mode") == "TESTNET" and not private_client.testnet:
         return "❌ Сейчас API mode не TESTNET. Переключи /api_mode testnet."
+    if order.get("mode") == "TESTNET" and not private_client.trading_enabled:
+        return "❌ BYBIT_TRADING_ENABLED=false. TESTNET cancel не отправлен на Bybit."
     if order.get("mode") == "REAL" and not real_trading_unlocked(storage):
         return REAL_LOCK_PHRASE
+    if order.get("mode") == "REAL" and mainnet_read_only_mode(storage):
+        logging.getLogger("DryRun").warning("Blocked MAINNET cancel_order in read-only mode")
+        return "❌ MAINNET read-only mode: cancel не отправлен."
     try:
         private_client.cancel_order(
             symbol=str(order.get("symbol")),
             order_id=str(order.get("exchange_order_id") or "") or None,
             order_link_id=str(order.get("order_link_id") or "") or None,
         )
-        storage.update_paper_order(str(order.get("id")), {"status": "CANCELLED"})
+        storage.update_paper_order(
+            str(order.get("id")),
+            {
+                "status": "CANCELLED",
+                "cancelled_at": datetime.now(UTC).isoformat(),
+                "closed_at": datetime.now(UTC).isoformat(),
+            },
+        )
         logging.getLogger("ExecutionAssistant").info(
             "Testnet order cancelled symbol=%s order_id=%s link_id=%s",
             order.get("symbol"),
@@ -1859,24 +2453,57 @@ def handle_cancel_all_testnet_request(
     telegram: TelegramClient,
     private_client: BybitPrivateClient,
 ) -> None:
+    logging.getLogger("EmergencyControl").warning("Cancel all TESTNET requested")
     telegram.send_message(
         "Отменить все TESTNET ордера?",
         reply_markup={
             "inline_keyboard": [
-                [{"text": "✅ Да, отменить все TESTNET", "callback_data": "cancel_all_testnet_confirm"}],
+                [{"text": "✅ Да, отменить TESTNET", "callback_data": "cancel_all_testnet_confirm"}],
                 [{"text": "❌ Нет", "callback_data": "cancel_all_testnet_cancel"}],
             ]
         },
     )
 
 
-def cancel_all_testnet_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+def handle_cancel_all_request(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    logger = logging.getLogger("EmergencyControl")
+    logger.warning("Cancel all requested mode=%s", private_client.mode_label())
+    if private_client.testnet:
+        handle_cancel_all_testnet_request(storage, telegram, private_client)
+        return
+    if not real_trading_unlocked(storage):
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+    telegram.send_message(
+        "⚠️ MAINNET cancel-all requested.\nВ этой фазе mainnet cancel-all не исполняется автоматически. Подтвердить отказ?",
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "✅ Подтвердить: не отменять MAINNET", "callback_data": "cancel_all_mainnet_confirm"}],
+                [{"text": "❌ Отмена", "callback_data": "cancel_all_mainnet_cancel"}],
+            ]
+        },
+    )
+
+
+def cancel_all_testnet_now(storage: Storage, private_client: BybitPrivateClient) -> dict[str, Any]:
+    result = {
+        "status": "skipped",
+        "cancelled": 0,
+        "errors": [],
+    }
     if not private_client.has_api_keys:
-        return "❌ Bybit API keys не настроены."
+        result["errors"].append("Bybit API keys не настроены.")
+        return result
     if not private_client.testnet:
-        return "❌ Сейчас API mode не TESTNET. Переключи /api_mode testnet."
-    cancelled = 0
-    errors = []
+        result["errors"].append("API mode is not TESTNET")
+        return result
+    if not private_client.trading_enabled:
+        result["errors"].append("BYBIT_TRADING_ENABLED=false")
+        return result
     try:
         for order in private_client.get_open_orders():
             symbol = order.get("symbol")
@@ -1884,18 +2511,41 @@ def cancel_all_testnet_text(storage: Storage, private_client: BybitPrivateClient
             order_link_id = order.get("orderLinkId")
             if symbol and (order_id or order_link_id):
                 private_client.cancel_order(str(symbol), order_id=order_id, order_link_id=order_link_id)
-                cancelled += 1
+                result["cancelled"] += 1
     except Exception as exc:
-        errors.append(sanitize_error(exc))
+        result["errors"].append(sanitize_error(exc))
 
-    for local_order in storage.get_paper_orders(statuses=["SUBMITTED"]):
+    for local_order in storage.get_paper_orders(
+        statuses=["SUBMITTED", "OPEN", "PARTIALLY_FILLED", "UNKNOWN", "CANCEL_REQUESTED"]
+    ):
         if local_order.get("mode") == "TESTNET":
-            storage.update_paper_order(str(local_order.get("id")), {"status": "CANCELLED"})
+            storage.update_paper_order(
+                str(local_order.get("id")),
+                {
+                    "status": "CANCELLED",
+                    "cancelled_at": datetime.now(UTC).isoformat(),
+                    "closed_at": datetime.now(UTC).isoformat(),
+                },
+            )
 
-    logging.getLogger("ExecutionAssistant").info("Cancel all testnet requested cancelled=%s", cancelled)
-    lines = [f"✅ TESTNET cancel запрос выполнен. Отменено: {cancelled}"]
-    if errors:
-        lines.append(f"Ошибки: {errors[0]}")
+    result["status"] = "failed" if result["errors"] else "done"
+    logging.getLogger("EmergencyControl").warning(
+        "Cancel all TESTNET completed status=%s cancelled=%s errors=%s",
+        result["status"],
+        result["cancelled"],
+        len(result["errors"]),
+    )
+    return result
+
+
+def cancel_all_testnet_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    result = cancel_all_testnet_now(storage, private_client)
+    if result["status"] == "skipped":
+        reason = result["errors"][0] if result["errors"] else "unknown"
+        return f"⚠️ TESTNET cancel skipped.\nПричина: {reason}"
+    lines = [f"✅ TESTNET cancel запрос выполнен. Отменено: {result['cancelled']}"]
+    if result["errors"]:
+        lines.append(f"Ошибки: {result['errors'][0]}")
     return "\n".join(lines)
 
 
@@ -1913,7 +2563,7 @@ def find_stored_order(storage: Storage, target: str) -> dict[str, Any] | None:
 
 def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     lines = ["📋 Ордера"]
-    orders = storage.get_paper_orders(statuses=["PLANNED", "SUBMITTED", "UNKNOWN"], limit=50)
+    orders = storage.get_paper_orders(limit=50)
     paper_orders = [order for order in orders if order.get("mode") in {None, "PAPER"}]
     testnet_orders = [order for order in orders if order.get("mode") == "TESTNET"]
     if not paper_orders and not testnet_orders:
@@ -1932,6 +2582,7 @@ def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
                     f"{index}. {order.get('symbol')} | {_direction_ru(order.get('side'))} | {order.get('status')}",
                     f"Entry: {order.get('entry_price')}",
                     f"Qty: {order.get('qty')}",
+                    f"Age: {_format_order_age(order.get('submitted_at') or order.get('created_at'))}",
                     f"Order ID: {order.get('exchange_order_id') or order.get('order_link_id') or order.get('id')}",
                     f"Created: {_format_order_time(order.get('created_at'))}",
                 ]
@@ -1975,6 +2626,21 @@ def _format_order_time(value: Any) -> str:
     except ValueError:
         return str(value)
     return parsed.strftime("%H:%M UTC")
+
+
+def _format_order_age(value: Any) -> str:
+    if not value:
+        return "n/a"
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return "n/a"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    minutes = max(0, int((datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60}h {minutes % 60}m"
 
 
 def positions_text(private_client: BybitPrivateClient) -> str:
@@ -2033,7 +2699,18 @@ def extract_usdt_balance(payload: dict[str, Any]) -> float:
 
 
 def has_active_paper_order(storage: Storage, symbol: str) -> bool:
-    for order in storage.get_paper_orders(statuses=["PLANNED", "SUBMITTED"]):
+    for order in storage.get_paper_orders(
+        statuses=[
+            "PLANNED",
+            "PAPER_CREATED",
+            "SUBMITTED",
+            "OPEN",
+            "PARTIALLY_FILLED",
+            "FILLED",
+            "POSITION_OPENED",
+            "UNKNOWN",
+        ]
+    ):
         if order.get("symbol") == symbol:
             return True
     return False
@@ -2050,6 +2727,59 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _round_dry_run_qty(qty: float, instrument_info: dict[str, Any] | None) -> float:
+    if qty <= 0:
+        return 0.0
+    step = _dry_run_qty_step(instrument_info)
+    if step is None or step <= 0:
+        return qty
+    rounded = math.floor(qty / step) * step
+    precision = max(0, min(12, _decimal_places(step)))
+    return round(rounded, precision)
+
+
+def _dry_run_qty_step(instrument_info: dict[str, Any] | None) -> float | None:
+    if not isinstance(instrument_info, dict):
+        return None
+    lot_filter = instrument_info.get("lotSizeFilter") or {}
+    return _to_float(lot_filter.get("qtyStep"))
+
+
+def _dry_run_min_qty(instrument_info: dict[str, Any] | None) -> float | None:
+    if not isinstance(instrument_info, dict):
+        return None
+    lot_filter = instrument_info.get("lotSizeFilter") or {}
+    return _to_float(lot_filter.get("minOrderQty"))
+
+
+def _decimal_places(value: float) -> int:
+    text = f"{value:.12f}".rstrip("0").rstrip(".")
+    if "." not in text:
+        return 0
+    return len(text.split(".", 1)[1])
+
+
+def _dry_run_profit_usdt(side: str, entry: float, target: float, position_size_usdt: float) -> float:
+    if entry <= 0:
+        return 0.0
+    if side == "LONG":
+        return position_size_usdt * ((target - entry) / entry)
+    return position_size_usdt * ((entry - target) / entry)
+
+
+def _dry_fmt(value: Any) -> str:
+    parsed = _to_float(value)
+    if parsed is None:
+        return "n/a"
+    if abs(parsed) >= 100:
+        return f"{parsed:.2f}"
+    if abs(parsed) >= 1:
+        return f"{parsed:.4f}"
+    if abs(parsed) >= 0.01:
+        return f"{parsed:.6f}"
+    return f"{parsed:.8f}"
+
+
 def _direction_ru(value: Any) -> str:
     return {"LONG": "ЛОНГ", "SHORT": "ШОРТ"}.get(str(value or ""), str(value or "n/a"))
 
@@ -2057,10 +2787,19 @@ def _direction_ru(value: Any) -> str:
 def _order_status_ru(value: Any) -> str:
     labels = {
         "PLANNED": "ЗАПЛАНИРОВАН",
+        "PAPER_CREATED": "PAPER СОЗДАН",
         "SUBMITTED": "ОТПРАВЛЕН",
+        "OPEN": "ОТКРЫТ",
+        "PARTIALLY_FILLED": "ЧАСТИЧНО ИСПОЛНЕН",
+        "CANCEL_REQUESTED": "ОТМЕНА ЗАПРОШЕНА",
         "FILLED": "ИСПОЛНЕН",
         "CANCELLED": "ОТМЕНЁН",
         "REJECTED": "ОТКЛОНЁН",
+        "EXPIRED": "ИСТЁК",
+        "INVALIDATED_BEFORE_FILL": "СЛОМАН ДО ИСПОЛНЕНИЯ",
+        "POSITION_OPENED": "ПОЗИЦИЯ ОТКРЫТА",
+        "POSITION_CLOSED": "ПОЗИЦИЯ ЗАКРЫТА",
+        "UNKNOWN": "НЕИЗВЕСТНО",
     }
     return labels.get(str(value or ""), str(value or "n/a"))
 
@@ -2099,6 +2838,24 @@ def poll_telegram_commands(
     storage.save()
 
 
+def maybe_sync_orders(
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    if not config.ORDER_SYNC_ENABLED:
+        return
+    now_ts = time.time()
+    last_ts = float(storage.get_runtime_state("last_order_sync_ts", 0) or 0)
+    if now_ts - last_ts < config.ORDER_SYNC_INTERVAL_SECONDS:
+        return
+    storage.save_runtime_state("last_order_sync_ts", now_ts)
+    try:
+        sync_testnet_orders(private_client, storage, telegram=telegram, notify=True)
+    except Exception as exc:
+        logging.getLogger("OrderLifecycle").error("Order sync loop failed: %s", exc)
+
+
 async def main_async() -> None:
     setup_logging()
     logger = logging.getLogger("main")
@@ -2110,10 +2867,14 @@ async def main_async() -> None:
     private_client = BybitPrivateClient(storage)
     telegram = TelegramClient(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
     scanner = MarketScanner(bybit, storage, telegram)
+    autopilot = TestnetAutopilot(storage, private_client, telegram)
+    scanner.autopilot_handler = autopilot.handle_alert
 
     logger.info("Starting Bybit Futures Radar")
     if config.HOSTING_MODE:
         logger.info("Hosting mode enabled")
+    if config.ORDER_SYNC_ENABLED:
+        logger.info("Order sync enabled interval=%ss", config.ORDER_SYNC_INTERVAL_SECONDS)
 
     bybit_available = bybit.check_connectivity()
     if bybit_available:
@@ -2161,6 +2922,7 @@ async def main_async() -> None:
                 next_scan_ts = time.monotonic() + config.SCAN_INTERVAL_SECONDS
 
             poll_telegram_commands(storage, telegram, scanner, private_client)
+            maybe_sync_orders(storage, telegram, private_client)
             await asyncio.sleep(1)
     finally:
         if health_server is not None:

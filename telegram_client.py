@@ -98,6 +98,9 @@ def build_setups_trading_menu_keyboard() -> dict[str, Any]:
         "inline_keyboard": [
             [{"text": "📋 Orders", "callback_data": "menu:trading_orders"}],
             [{"text": "🔑 API", "callback_data": "menu:trading_api"}],
+            [{"text": "🛡 Risk", "callback_data": "menu:trading_risk"}],
+            [{"text": "🚨 Emergency", "callback_data": "menu:trading_emergency"}],
+            [{"text": "🤖 Autopilot", "callback_data": "menu:trading_autopilot"}],
             [{"text": "🐺 Real Gate", "callback_data": "menu:trading_real"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
@@ -109,9 +112,8 @@ def build_trading_orders_menu_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [{"text": "📋 Ордера", "callback_data": "cmd:/orders"}],
-            [{"text": "📊 Позиции", "callback_data": "cmd:/positions"}],
-            [{"text": "💰 Баланс", "callback_data": "cmd:/balance"}],
-            [{"text": "🚫 Cancel All TESTNET", "callback_data": "cmd:/cancel_all_testnet"}],
+            [{"text": "🔄 Sync Orders", "callback_data": "cmd:/sync_orders"}],
+            [{"text": "❌ Cancel All TESTNET", "callback_data": "cmd:/cancel_all_testnet"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
@@ -135,10 +137,53 @@ def build_trading_api_menu_keyboard() -> dict[str, Any]:
     }
 
 
+def build_trading_risk_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "🛡 Safety Status", "callback_data": "cmd:/safety_status"}],
+            [{"text": "⚙️ Config", "callback_data": "cmd:/config"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_emergency_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "🚨 Panic", "callback_data": "cmd:/panic"}],
+            [{"text": "✅ Panic Off", "callback_data": "cmd:/panic_off"}],
+            [{"text": "🔒 Disable Trading", "callback_data": "cmd:/disable_trading"}],
+            [{"text": "🧪 Enable Testnet Trading", "callback_data": "cmd:/enable_testnet_trading"}],
+            [{"text": "❌ Cancel All TESTNET", "callback_data": "cmd:/cancel_all_testnet"}],
+            [{"text": "🛡 Safety Status", "callback_data": "cmd:/safety_status"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_autopilot_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "🤖 Status", "callback_data": "cmd:/autopilot_status"}],
+            [{"text": "▶️ Enable TESTNET Autopilot", "callback_data": "cmd:/autopilot_on"}],
+            [{"text": "⏸ Disable Autopilot", "callback_data": "cmd:/autopilot_off"}],
+            [{"text": "📜 Rules", "callback_data": "cmd:/autopilot_rules"}],
+            [{"text": "📒 Journal", "callback_data": "cmd:/autopilot_journal"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
 def build_trading_real_menu_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [{"text": "🐺 Real Status", "callback_data": "cmd:/real_status"}],
+            [{"text": "🧪 Dry Run Status", "callback_data": "cmd:/dry_run_status"}],
+            [{"text": "🔍 Mainnet Check", "callback_data": "cmd:/mainnet_check"}],
+            [{"text": "🧮 Dry Run Order Help", "callback_data": "cmd:/dry_run_order help"}],
             [{"text": "🔓 Enable Real", "callback_data": "cmd:/enable_real"}],
             [{"text": "🔒 Disable Real", "callback_data": "cmd:/disable_real"}],
             [{"text": "🚨 Panic", "callback_data": "cmd:/panic"}],
