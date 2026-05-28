@@ -705,6 +705,9 @@ def close_menu_message(telegram: TelegramClient, message: dict[str, Any]) -> Non
 
 
 REAL_LOCK_PHRASE = "пошел нахуй, ждем 80%+"
+TESTNET_API_NOT_READY_TEXT = (
+    "❌ TESTNET order rejected: API not ready. Paper fallback disabled because trading is enabled."
+)
 
 
 def api_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
@@ -762,17 +765,19 @@ def api_status_text(storage: Storage, private_client: BybitPrivateClient) -> str
             ]
         )
 
-    return "\n".join(
-        lines
-        + (
-        [
-            "",
-            "⚠️ API secret хранится локально в базе. Это быстрый режим, не максимальная безопасность.",
-        ]
-        if private_client.credential_source == "TELEGRAM_DB"
-        else []
+    if private_client.credential_source == "TELEGRAM_DB":
+        lines.extend(
+            [
+                "",
+                "⚠️ API secret хранится локально в базе. Это быстрый режим, не максимальная безопасность.",
+            ]
         )
-    )
+        if config.HOSTING_MODE:
+            lines.append(
+                "⚠️ TELEGRAM_DB credentials may disappear after Render redeploy. Use Render Environment for stable hosting."
+            )
+
+    return "\n".join(lines)
 
 
 def api_test_text(storage: Storage, private_client: BybitPrivateClient) -> str:
@@ -1501,7 +1506,7 @@ def real_trading_unlocked(storage: Storage) -> bool:
 def effective_real_trading(storage: Storage, private_client: BybitPrivateClient) -> bool:
     return (
         config.BYBIT_TRADING_ENABLED
-        and not config.BYBIT_TESTNET
+        and not private_client.testnet
         and not mainnet_read_only_mode(storage)
         and private_client.has_api_keys
         and real_trading_unlocked(storage)
@@ -1556,16 +1561,25 @@ def order_safety_block_text(
 
 
 def safety_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    private_client.load_credentials(storage)
     panic = bool(storage.get_runtime_state("PANIC_MODE", False))
     runtime_disabled = bool(storage.get_runtime_state("RUNTIME_TRADING_DISABLED", False))
     real_unlocked = real_trading_unlocked(storage)
     block_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=True)
-    api_ok = False
+    checks = {"balance_ok": False, "positions_ok": False, "orders_ok": False, "errors": []}
     if private_client.can_call_private:
         checks = run_private_api_checks(private_client)
-        api_ok = checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]
+    api_ok = checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]
     daily_loss_lock = bool(storage.get_runtime_state("daily_loss_limit_reached", False))
     mode = safety_mode_label(private_client)
+    execution_mode = execution_mode_label(storage, private_client)
+    paper_fallback = not config.BYBIT_TRADING_ENABLED
+    testnet_capability_ok = (
+        config.BYBIT_TRADING_ENABLED
+        and private_client.testnet
+        and private_client.has_api_keys
+        and api_ok
+    )
     allowed = not block_reasons
     reason = block_reasons[0] if block_reasons else "none"
     return "\n".join(
@@ -1577,6 +1591,10 @@ def safety_status_text(storage: Storage, private_client: BybitPrivateClient) -> 
             f"Real trading unlocked: {str(real_unlocked).lower()}",
             f"BYBIT_TRADING_ENABLED env: {str(config.BYBIT_TRADING_ENABLED).lower()}",
             f"Mode: {mode}",
+            f"Execution mode: {execution_mode}",
+            f"Paper fallback: {'enabled' if paper_fallback else 'disabled'}",
+            f"API source: {private_client.credential_source}",
+            f"Testnet order capability: {'OK' if testnet_capability_ok else 'ERROR'}",
             f"New orders allowed: {'yes' if allowed else 'no'}",
             f"Reason if blocked: {reason}",
             "",
@@ -1591,6 +1609,16 @@ def safety_mode_label(private_client: BybitPrivateClient) -> str:
     if not config.BYBIT_TRADING_ENABLED:
         return "PAPER"
     return "TESTNET" if private_client.testnet else "MAINNET"
+
+
+def execution_mode_label(storage: Storage, private_client: BybitPrivateClient) -> str:
+    if not config.BYBIT_TRADING_ENABLED:
+        return "PAPER"
+    if private_client.testnet:
+        return "TESTNET"
+    if effective_real_trading(storage, private_client):
+        return "REAL"
+    return "MAINNET_LOCKED"
 
 
 def real_gate_stats(storage: Storage) -> dict[str, Any]:
@@ -1639,7 +1667,7 @@ def real_order_safety_rejections(
     reasons = order_safety_block_reasons(storage, private_client, include_real_gate=True)
     if not config.BYBIT_TRADING_ENABLED:
         reasons.append("BYBIT_TRADING_ENABLED=false")
-    if config.BYBIT_TESTNET:
+    if private_client.testnet:
         reasons.append("BYBIT_TESTNET=true")
     if not private_client.testnet and mainnet_read_only_mode(storage):
         reasons.append("MAINNET_READ_ONLY_MODE=true")
@@ -1752,6 +1780,24 @@ def testnet_rejection_text(plan: dict[str, Any], reason: str) -> str:
             f"Направление: {_direction_ru(plan.get('side'))}",
         ]
     )
+
+
+def testnet_api_not_ready(reasons: list[str]) -> bool:
+    api_markers = (
+        "Bybit API keys",
+        "API test failed",
+        "permissions/API",
+        "balance:",
+        "positions:",
+        "orders:",
+    )
+    return any(any(marker in reason for marker in api_markers) for reason in reasons)
+
+
+def testnet_order_rejection_message(plan: dict[str, Any], reasons: list[str]) -> str:
+    if testnet_api_not_ready(reasons):
+        return TESTNET_API_NOT_READY_TEXT
+    return testnet_rejection_text(plan, reasons[0] if reasons else "unknown")
 
 
 def mask_secret(value: str) -> str:
@@ -1869,6 +1915,7 @@ def submit_order_plan(
     private_client: BybitPrivateClient,
 ) -> None:
     logger = logging.getLogger("ExecutionAssistant")
+    private_client.load_credentials(storage)
     plan = storage.get_paper_order(plan_id)
     if plan is None:
         send_with_keyboard(telegram, "❌ План ордера не найден.", build_main_menu_keyboard())
@@ -1877,10 +1924,19 @@ def submit_order_plan(
         send_with_keyboard(telegram, f"❌ План уже имеет статус: {plan.get('status')}", build_main_menu_keyboard())
         return
 
+    if config.BYBIT_TRADING_ENABLED and not private_client.testnet and not real_trading_unlocked(storage):
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "REAL_TRADING_UNLOCKED=false"})
+        logger.warning("Order rejected reason=real locked symbol=%s setup_id=%s", plan.get("symbol"), plan.get("source_setup_id"))
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+
     safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
     if safety_reasons:
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(safety_reasons)})
         logger.warning("Order blocked by safety control symbol=%s reason=%s", plan.get("symbol"), "; ".join(safety_reasons))
+        if config.BYBIT_TRADING_ENABLED and private_client.testnet and testnet_api_not_ready(safety_reasons):
+            send_with_keyboard(telegram, TESTNET_API_NOT_READY_TEXT, build_main_menu_keyboard())
+            return
         send_with_keyboard(
             telegram,
             order_safety_block_text(storage, private_client, safety_reasons),
@@ -1889,7 +1945,8 @@ def submit_order_plan(
         return
 
     if config.BYBIT_TRADING_ENABLED and not private_client.has_api_keys:
-        send_with_keyboard(telegram, "Bybit API keys не настроены.", build_main_menu_keyboard())
+        message = TESTNET_API_NOT_READY_TEXT if private_client.testnet else "Bybit API keys не настроены."
+        send_with_keyboard(telegram, message, build_main_menu_keyboard())
         return
 
     if not config.BYBIT_TRADING_ENABLED:
@@ -1917,18 +1974,7 @@ def submit_order_plan(
         )
         return
 
-    if config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and not real_trading_unlocked(storage):
-        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "REAL_TRADING_UNLOCKED=false"})
-        logger.warning("Order rejected reason=real locked symbol=%s setup_id=%s", plan.get("symbol"), plan.get("source_setup_id"))
-        telegram.send_message(REAL_LOCK_PHRASE)
-        send_with_keyboard(
-            telegram,
-            "Real trading locked.\nUse /real_status.",
-            build_trading_real_menu_keyboard(),
-        )
-        return
-
-    if config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and real_trading_unlocked(storage):
+    if config.BYBIT_TRADING_ENABLED and not private_client.testnet and real_trading_unlocked(storage):
         reasons = real_order_safety_rejections(storage, private_client, plan)
         if reasons:
             storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(reasons)})
@@ -1946,12 +1992,12 @@ def submit_order_plan(
         )
         return
 
-    if config.BYBIT_TRADING_ENABLED and config.BYBIT_TESTNET:
+    if config.BYBIT_TRADING_ENABLED and private_client.testnet:
         reasons = testnet_order_safety_rejections(storage, private_client, plan)
         if reasons:
             storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(reasons)})
             logger.warning("Testnet order rejected symbol=%s reason=%s", plan.get("symbol"), "; ".join(reasons))
-            send_with_keyboard(telegram, testnet_rejection_text(plan, reasons[0]), build_main_menu_keyboard())
+            send_with_keyboard(telegram, testnet_order_rejection_message(plan, reasons), build_main_menu_keyboard())
             return
         logger.info("Testnet order confirmation requested symbol=%s setup_id=%s", plan.get("symbol"), plan.get("source_setup_id"))
         telegram.send_message(
@@ -2016,6 +2062,7 @@ def submit_testnet_order_after_confirmation(
     private_client: BybitPrivateClient,
 ) -> None:
     logger = logging.getLogger("ExecutionAssistant")
+    private_client.load_credentials(storage)
     plan = storage.get_paper_order(plan_id)
     if plan is None:
         send_with_keyboard(telegram, "❌ План ордера не найден.", build_main_menu_keyboard())
@@ -2023,7 +2070,7 @@ def submit_testnet_order_after_confirmation(
     if plan.get("status") != "PLANNED":
         send_with_keyboard(telegram, f"❌ План уже имеет статус: {plan.get('status')}", build_main_menu_keyboard())
         return
-    if not (config.BYBIT_TRADING_ENABLED and config.BYBIT_TESTNET):
+    if not (config.BYBIT_TRADING_ENABLED and private_client.testnet):
         send_with_keyboard(telegram, "❌ TESTNET ордер отклонён\n\nПричина: режим не TESTNET.", build_main_menu_keyboard())
         return
 
@@ -2031,6 +2078,9 @@ def submit_testnet_order_after_confirmation(
     if safety_reasons:
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(safety_reasons)})
         logger.warning("Testnet order blocked by safety control symbol=%s reason=%s", plan.get("symbol"), "; ".join(safety_reasons))
+        if testnet_api_not_ready(safety_reasons):
+            send_with_keyboard(telegram, TESTNET_API_NOT_READY_TEXT, build_main_menu_keyboard())
+            return
         send_with_keyboard(
             telegram,
             order_safety_block_text(storage, private_client, safety_reasons),
@@ -2042,7 +2092,7 @@ def submit_testnet_order_after_confirmation(
     if reasons:
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(reasons)})
         logger.warning("Testnet order rejected after confirmation symbol=%s reason=%s", plan.get("symbol"), "; ".join(reasons))
-        send_with_keyboard(telegram, testnet_rejection_text(plan, reasons[0]), build_main_menu_keyboard())
+        send_with_keyboard(telegram, testnet_order_rejection_message(plan, reasons), build_main_menu_keyboard())
         return
 
     order_link_id = str(plan.get("order_link_id") or f"bobabot-testnet-{uuid.uuid4().hex[:18]}")
@@ -2104,6 +2154,7 @@ def submit_real_order_after_confirmation(
     private_client: BybitPrivateClient,
 ) -> None:
     logger = logging.getLogger("ExecutionAssistant")
+    private_client.load_credentials(storage)
     plan = storage.get_paper_order(plan_id)
     if plan is None:
         send_with_keyboard(telegram, "❌ План ордера не найден.", build_main_menu_keyboard())
@@ -2111,6 +2162,11 @@ def submit_real_order_after_confirmation(
     if plan.get("status") != "PLANNED":
         send_with_keyboard(telegram, f"❌ План уже имеет статус: {plan.get('status')}", build_main_menu_keyboard())
         return
+    if config.BYBIT_TRADING_ENABLED and not private_client.testnet and not real_trading_unlocked(storage):
+        storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "real gate closed"})
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+
     safety_reasons = order_safety_block_reasons(storage, private_client, include_real_gate=False)
     if safety_reasons:
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "; ".join(safety_reasons)})
@@ -2121,14 +2177,9 @@ def submit_real_order_after_confirmation(
             build_trading_emergency_menu_keyboard(),
         )
         return
-    if not (config.BYBIT_TRADING_ENABLED and not config.BYBIT_TESTNET and real_trading_unlocked(storage)):
+    if not (config.BYBIT_TRADING_ENABLED and not private_client.testnet and real_trading_unlocked(storage)):
         storage.update_paper_order(plan_id, {"status": "REJECTED", "reject_reason": "real gate closed"})
         telegram.send_message(REAL_LOCK_PHRASE)
-        send_with_keyboard(
-            telegram,
-            "Real trading locked.\nUse /real_status.",
-            build_trading_real_menu_keyboard(),
-        )
         return
 
     reasons = real_order_safety_rejections(storage, private_client, plan)
@@ -2569,13 +2620,15 @@ def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     if not paper_orders and not testnet_orders:
         lines.append("Активных ордеров нет.")
 
+    lines.extend(["", "Paper orders:"])
     if paper_orders:
-        lines.extend(["", "Paper orders:"])
         for order in paper_orders[:10]:
             lines.append(_format_local_order_line(order))
+    else:
+        lines.append("- нет")
 
+    lines.extend(["", "Bybit TESTNET orders:"])
     if testnet_orders:
-        lines.extend(["", "Testnet orders:"])
         for index, order in enumerate(testnet_orders[:10], start=1):
             lines.extend(
                 [
@@ -2587,12 +2640,14 @@ def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
                     f"Created: {_format_order_time(order.get('created_at'))}",
                 ]
             )
+    else:
+        lines.append("- нет")
 
+    lines.append("")
+    lines.append("Bybit open orders:")
     if private_client.can_call_private:
         try:
             open_orders = private_client.get_open_orders()
-            lines.append("")
-            lines.append("Открытые ордера Bybit:")
             if open_orders:
                 for order in open_orders[:10]:
                     lines.append(
@@ -2604,10 +2659,9 @@ def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
             else:
                 lines.append("- открытых ордеров нет")
         except Exception as exc:
-            lines.append(f"Открытые ордера Bybit: ошибка API ({exc})")
+            lines.append(f"- ошибка API ({exc})")
     else:
-        lines.append("")
-        lines.append("Ордера Bybit: API credentials not configured")
+        lines.append("- API credentials not configured")
     return "\n".join(lines)
 
 

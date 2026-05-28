@@ -121,3 +121,18 @@ backup_bot_state_YYYYMMDD_HHMMSS.db
 ```
 
 На бесплатных PaaS локальная файловая система может быть временной. Для долговременного хранения лучше подключить persistent disk, если тариф/платформа это поддерживает.
+
+## 8. TESTNET API keys на Render
+
+Для стабильного TESTNET исполнения на Render храни Bybit API ключи именно в Render Environment, а не через Telegram DB. Telegram-stored credentials лежат в локальной SQLite базе и могут исчезнуть после redeploy/free container reset.
+
+Добавь в Render Environment:
+
+```text
+BYBIT_API_KEY=...
+BYBIT_API_SECRET=...
+BYBIT_TESTNET=true
+BYBIT_TRADING_ENABLED=true
+```
+
+Когда `BYBIT_TRADING_ENABLED=true` и `BYBIT_TESTNET=true`, bot больше не делает paper fallback: если API keys отсутствуют или API test не проходит, TESTNET ордер будет отклонён.
