@@ -125,12 +125,12 @@ def build_trading_api_menu_keyboard() -> dict[str, Any]:
         "inline_keyboard": [
             [{"text": "🔑 API Status", "callback_data": "cmd:/api_status"}],
             [{"text": "🧪 API Test", "callback_data": "cmd:/api_test"}],
-            [{"text": "📘 API Help", "callback_data": "cmd:/api_help"}],
-            [{"text": "🔐 API Set", "callback_data": "cmd:/api_set"}],
-            [{"text": "🧹 API Clear", "callback_data": "cmd:/api_clear"}],
-            [{"text": "🔁 API Mode Testnet", "callback_data": "cmd:/api_mode testnet"}],
-            [{"text": "🔁 API Mode Mainnet", "callback_data": "cmd:/api_mode mainnet"}],
+            [{"text": "🔐 Внести API ключи", "callback_data": "cmd:/api_set"}],
+            [{"text": "🧹 Clear API", "callback_data": "cmd:/api_clear"}],
+            [{"text": "🔁 Mode Testnet", "callback_data": "cmd:/api_mode testnet"}],
+            [{"text": "🔁 Mode Mainnet", "callback_data": "cmd:/api_mode mainnet"}],
             [{"text": "🔄 API Reload", "callback_data": "cmd:/api_reload"}],
+            [{"text": "📘 API Help", "callback_data": "cmd:/api_help"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
