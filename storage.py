@@ -27,6 +27,16 @@ ORDER_STATE_CACHE_STATUSES = [
     "UNKNOWN",
 ]
 
+RUNTIME_CONFIG_KEYS = {
+    "BYBIT_TRADING_ENABLED",
+    "BYBIT_TESTNET",
+    "TESTNET_AUTOPILOT_ENABLED",
+    "SCAN_INTERVAL_SECONDS",
+    "TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS",
+    "ACCOUNT_RISK_PERCENT",
+    "PAPER_ACCOUNT_BALANCE_USDT",
+}
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -92,6 +102,8 @@ class Storage:
             if key.startswith("sqlite_"):
                 continue
             state[key] = value
+        self._apply_runtime_config_overrides(runtime_state)
+        self.apply_fee_settings(self.get_fee_settings())
 
         state["recent_alerts"] = self.database.get_alert_history(limit=config.RECENT_ALERTS_LIMIT)
         state["active_setups"] = self.database.get_active_setups()
@@ -280,11 +292,72 @@ class Storage:
     def save_runtime_state(self, key: str, value: Any) -> None:
         self.state[key] = value
         self.database.save_runtime_state(key, value)
+        self._apply_runtime_config_key(key, value)
 
     def get_runtime_state(self, key: str, default: Any = None) -> Any:
         if key in self.state:
             return self.state.get(key, default)
         return self.database.get_runtime_state(key, default)
+
+    def get_fee_settings(self) -> dict[str, Any]:
+        settings = self.database.get_fee_settings() or {}
+        defaults = {
+            "derivatives_taker_fee_percent": config.DERIVATIVES_TAKER_FEE_PERCENT,
+            "derivatives_maker_fee_percent": config.DERIVATIVES_MAKER_FEE_PERCENT,
+            "spot_taker_fee_percent": config.SPOT_TAKER_FEE_PERCENT,
+            "spot_maker_fee_percent": config.SPOT_MAKER_FEE_PERCENT,
+            "fee_mode": config.FEE_MODE,
+        }
+        defaults.update({key: value for key, value in settings.items() if value is not None})
+        return defaults
+
+    def save_fee_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_fee_settings()
+        current.update(settings)
+        saved = self.database.save_fee_settings(current)
+        self.apply_fee_settings(saved)
+        return saved
+
+    def apply_fee_settings(self, settings: dict[str, Any]) -> None:
+        mode = str(settings.get("fee_mode") or "maker").lower()
+        if mode not in {"maker", "taker", "worst_case"}:
+            mode = "maker"
+        config.DERIVATIVES_TAKER_FEE_PERCENT = float(settings.get("derivatives_taker_fee_percent", 0.1000))
+        config.DERIVATIVES_MAKER_FEE_PERCENT = float(settings.get("derivatives_maker_fee_percent", 0.0360))
+        config.SPOT_TAKER_FEE_PERCENT = float(settings.get("spot_taker_fee_percent", 0.1800))
+        config.SPOT_MAKER_FEE_PERCENT = float(settings.get("spot_maker_fee_percent", 0.1000))
+        config.FEE_MODE = mode
+        config.DEFAULT_EXECUTION_FEE_MODE = mode
+        config.BYBIT_TAKER_FEE_RATE = config.DERIVATIVES_TAKER_FEE_PERCENT / 100
+        config.BYBIT_MAKER_FEE_RATE = config.DERIVATIVES_MAKER_FEE_PERCENT / 100
+
+    def runtime_setting_source(self, key: str) -> str:
+        runtime_state = self.database.get_all_runtime_state()
+        return "RUNTIME_DB" if key in runtime_state else "ENV"
+
+    def apply_runtime_config_overrides(self) -> None:
+        self._apply_runtime_config_overrides(self.database.get_all_runtime_state())
+
+    def _apply_runtime_config_overrides(self, runtime_state: dict[str, Any]) -> None:
+        for key in RUNTIME_CONFIG_KEYS:
+            if key in runtime_state:
+                self._apply_runtime_config_key(key, runtime_state[key])
+
+    def _apply_runtime_config_key(self, key: str, value: Any) -> None:
+        if key == "BYBIT_TRADING_ENABLED":
+            config.BYBIT_TRADING_ENABLED = bool(value)
+        elif key == "BYBIT_TESTNET":
+            config.BYBIT_TESTNET = bool(value)
+        elif key == "TESTNET_AUTOPILOT_ENABLED":
+            config.TESTNET_AUTOPILOT_ENABLED = bool(value)
+        elif key == "SCAN_INTERVAL_SECONDS":
+            config.SCAN_INTERVAL_SECONDS = int(value)
+        elif key == "TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS":
+            config.TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS = int(value)
+        elif key == "ACCOUNT_RISK_PERCENT":
+            config.ACCOUNT_RISK_PERCENT = float(value)
+        elif key == "PAPER_ACCOUNT_BALANCE_USDT":
+            config.PAPER_ACCOUNT_BALANCE_USDT = float(value)
 
     def get_setup_statistics(self) -> dict[str, Any]:
         records = self.get_setup_journal(limit=None)

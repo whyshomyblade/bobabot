@@ -827,6 +827,8 @@ def _risk_percent(record: dict[str, Any]) -> float | None:
 def _fee_rate_for_mode(fee_mode: str) -> float:
     if fee_mode == "maker":
         return config.BYBIT_MAKER_FEE_RATE
+    if fee_mode == "worst_case":
+        return max(config.BYBIT_MAKER_FEE_RATE, config.BYBIT_TAKER_FEE_RATE)
     return config.BYBIT_TAKER_FEE_RATE
 
 

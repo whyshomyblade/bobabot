@@ -86,16 +86,30 @@ def build_order_plan_from_alert(
         return _reject(base_plan, f"qty меньше minOrderQty ({min_qty:g})")
 
     position_size_usdt = qty * entry_price
-    estimated_fee_usdt = position_size_usdt * config.BYBIT_TAKER_FEE_RATE * 2
+    fee_mode = _fee_mode()
+    fee_rate = _fee_rate_for_mode(fee_mode)
+    estimated_entry_fee = position_size_usdt * fee_rate
+    estimated_exit_fee_tp1 = qty * tp1 * fee_rate
+    estimated_exit_fee_tp2 = qty * tp2 * fee_rate
+    estimated_stop_fee = qty * stop_price * fee_rate
+    estimated_fee_usdt = estimated_entry_fee + estimated_exit_fee_tp1
     estimated_slippage_usdt = position_size_usdt * (config.SLIPPAGE_PERCENT / 100)
-    max_loss_usdt = risk_usdt + estimated_fee_usdt + estimated_slippage_usdt
-    tp1_profit_usdt = _profit_usdt(side, entry_price, tp1, position_size_usdt) - estimated_fee_usdt - estimated_slippage_usdt
-    tp2_profit_usdt = _profit_usdt(side, entry_price, tp2, position_size_usdt) - estimated_fee_usdt - estimated_slippage_usdt
+    gross_risk_usdt = abs(_profit_usdt(side, entry_price, stop_price, position_size_usdt))
+    gross_reward_tp1 = _profit_usdt(side, entry_price, tp1, position_size_usdt)
+    gross_reward_tp2 = _profit_usdt(side, entry_price, tp2, position_size_usdt)
+    max_loss_usdt = gross_risk_usdt + estimated_entry_fee + estimated_stop_fee + estimated_slippage_usdt
+    tp1_profit_usdt = gross_reward_tp1 - estimated_entry_fee - estimated_exit_fee_tp1 - estimated_slippage_usdt
+    tp2_profit_usdt = gross_reward_tp2 - estimated_entry_fee - estimated_exit_fee_tp2 - estimated_slippage_usdt
     rr_tp1 = abs(tp1 - entry_price) / stop_distance if stop_distance > 0 else 0
     rr_tp2 = abs(tp2 - entry_price) / stop_distance if stop_distance > 0 else 0
+    net_r_tp1 = tp1_profit_usdt / gross_risk_usdt if gross_risk_usdt > 0 else 0
+    net_r_tp2 = tp2_profit_usdt / gross_risk_usdt if gross_risk_usdt > 0 else 0
+    net_r_stop = -max_loss_usdt / gross_risk_usdt if gross_risk_usdt > 0 else -1
 
     if rr_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
         return _reject(base_plan, "R/R ниже минимального порога")
+    if net_r_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
+        return _reject(base_plan, "R/R после комиссий ниже минимума")
 
     base_plan.update(
         {
@@ -113,6 +127,15 @@ def build_order_plan_from_alert(
             "stop_distance_percent": stop_distance_percent,
             "position_size_usdt": position_size_usdt,
             "qty": qty,
+            "gross_risk_usdt": gross_risk_usdt,
+            "gross_reward_tp1": gross_reward_tp1,
+            "gross_reward_tp2": gross_reward_tp2,
+            "fee_mode": fee_mode,
+            "fee_rate": fee_rate,
+            "estimated_entry_fee": estimated_entry_fee,
+            "estimated_exit_fee_tp1": estimated_exit_fee_tp1,
+            "estimated_exit_fee_tp2": estimated_exit_fee_tp2,
+            "estimated_stop_fee": estimated_stop_fee,
             "estimated_fee_usdt": estimated_fee_usdt,
             "estimated_slippage_usdt": estimated_slippage_usdt,
             "max_loss_usdt": max_loss_usdt,
@@ -120,6 +143,9 @@ def build_order_plan_from_alert(
             "tp2_profit_usdt": tp2_profit_usdt,
             "rr_tp1": rr_tp1,
             "rr_tp2": rr_tp2,
+            "net_r_tp1": net_r_tp1,
+            "net_r_tp2": net_r_tp2,
+            "net_r_stop": net_r_stop,
             "safety": _safety_lines(has_existing_order, has_existing_position),
             "status": "PLANNED",
         }
@@ -151,11 +177,23 @@ def format_order_plan(plan: dict[str, Any]) -> str:
         f"Размер позиции: {plan.get('position_size_usdt', 0):.2f} USDT",
         f"Qty: {_fmt_qty(plan.get('qty'))}",
         "",
-        f"Комиссия estimate: {plan.get('estimated_fee_usdt', 0):.4f} USDT",
+        "💸 Fees:",
+        f"Mode: {plan.get('fee_mode')}",
+        f"Entry fee estimate: {plan.get('estimated_entry_fee', 0):.4f} USDT",
+        f"TP1 exit fee estimate: {plan.get('estimated_exit_fee_tp1', 0):.4f} USDT",
+        f"TP2 exit fee estimate: {plan.get('estimated_exit_fee_tp2', 0):.4f} USDT",
+        f"Stop exit fee estimate: {plan.get('estimated_stop_fee', 0):.4f} USDT",
         f"Проскальзывание estimate: {plan.get('estimated_slippage_usdt', 0):.4f} USDT",
         f"Макс убыток estimate: {plan.get('max_loss_usdt', 0):.4f} USDT",
         f"TP1 estimate: {plan.get('tp1_profit_usdt', 0):.4f} USDT",
         f"TP2 estimate: {plan.get('tp2_profit_usdt', 0):.4f} USDT",
+        "",
+        "Net R:",
+        f"TP1 gross: {plan.get('rr_tp1', 0):.2f}R",
+        f"TP1 net: {plan.get('net_r_tp1', 0):.2f}R",
+        f"TP2 gross: {plan.get('rr_tp2', 0):.2f}R",
+        f"TP2 net: {plan.get('net_r_tp2', 0):.2f}R",
+        f"Stop net: {plan.get('net_r_stop', 0):.2f}R",
         "",
         f"Execution:\n{_execution_label(plan.get('execution_status'))}",
         "",
@@ -278,6 +316,19 @@ def _mode_label() -> str:
     if not config.BYBIT_TRADING_ENABLED:
         return "PAPER"
     return "TESTNET" if config.BYBIT_TESTNET else "REAL"
+
+
+def _fee_mode() -> str:
+    mode = str(getattr(config, "FEE_MODE", config.DEFAULT_EXECUTION_FEE_MODE) or "maker").lower()
+    return mode if mode in {"maker", "taker", "worst_case"} else "maker"
+
+
+def _fee_rate_for_mode(mode: str) -> float:
+    if mode == "maker":
+        return config.BYBIT_MAKER_FEE_RATE
+    if mode == "worst_case":
+        return max(config.BYBIT_MAKER_FEE_RATE, config.BYBIT_TAKER_FEE_RATE)
+    return config.BYBIT_TAKER_FEE_RATE
 
 
 def _direction_ru(value: Any) -> str:

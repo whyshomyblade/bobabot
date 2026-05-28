@@ -94,6 +94,19 @@ class BotDatabase:
             )
             self.connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS fee_settings (
+                    id TEXT PRIMARY KEY,
+                    derivatives_taker_fee_percent REAL NOT NULL,
+                    derivatives_maker_fee_percent REAL NOT NULL,
+                    spot_taker_fee_percent REAL NOT NULL,
+                    spot_maker_fee_percent REAL NOT NULL,
+                    fee_mode TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS backtest_runs (
                     id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
@@ -551,6 +564,55 @@ class BotDatabase:
 
     def count_autopilot_decisions(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM autopilot_decisions").fetchone()[0])
+
+    def get_fee_settings(self) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT derivatives_taker_fee_percent, derivatives_maker_fee_percent,
+                   spot_taker_fee_percent, spot_maker_fee_percent, fee_mode, updated_at
+            FROM fee_settings
+            WHERE id = 'active'
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def save_fee_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        now = self._now()
+        saved = {
+            "derivatives_taker_fee_percent": float(settings.get("derivatives_taker_fee_percent", 0.0)),
+            "derivatives_maker_fee_percent": float(settings.get("derivatives_maker_fee_percent", 0.0)),
+            "spot_taker_fee_percent": float(settings.get("spot_taker_fee_percent", 0.0)),
+            "spot_maker_fee_percent": float(settings.get("spot_maker_fee_percent", 0.0)),
+            "fee_mode": str(settings.get("fee_mode") or "maker"),
+            "updated_at": now,
+        }
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO fee_settings
+                    (id, derivatives_taker_fee_percent, derivatives_maker_fee_percent,
+                     spot_taker_fee_percent, spot_maker_fee_percent, fee_mode, updated_at)
+                VALUES ('active', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    derivatives_taker_fee_percent = excluded.derivatives_taker_fee_percent,
+                    derivatives_maker_fee_percent = excluded.derivatives_maker_fee_percent,
+                    spot_taker_fee_percent = excluded.spot_taker_fee_percent,
+                    spot_maker_fee_percent = excluded.spot_maker_fee_percent,
+                    fee_mode = excluded.fee_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    saved["derivatives_taker_fee_percent"],
+                    saved["derivatives_maker_fee_percent"],
+                    saved["spot_taker_fee_percent"],
+                    saved["spot_maker_fee_percent"],
+                    saved["fee_mode"],
+                    now,
+                ),
+            )
+        return saved
 
     def save_api_credentials(
         self,

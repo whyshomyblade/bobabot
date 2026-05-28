@@ -72,8 +72,10 @@ from telegram_client import (
     build_trading_api_menu_keyboard,
     build_trading_autopilot_menu_keyboard,
     build_trading_emergency_menu_keyboard,
+    build_trading_fees_menu_keyboard,
     build_trading_orders_menu_keyboard,
     build_trading_risk_menu_keyboard,
+    build_trading_runtime_menu_keyboard,
     build_trading_real_menu_keyboard,
 )
 
@@ -113,6 +115,15 @@ BUTTON_COMMANDS = {
     "🔁 API Mode Mainnet": "/api_mode mainnet",
     "🔁 Mode Mainnet": "/api_mode mainnet",
     "🔄 API Reload": "/api_reload",
+    "💸 Fee Status": "/fees",
+    "🧾 Set My Fees": "/set_fees 0.1000 0.0360",
+    "Maker Mode": "/set_fee_mode maker",
+    "Taker Mode": "/set_fee_mode taker",
+    "Worst Case Mode": "/set_fee_mode worst_case",
+    "⚙️ Runtime Status": "/runtime_status",
+    "🧪 Enable Testnet Trading": "/set_trading_enabled true",
+    "🤖 Enable Autopilot": "/set_autopilot_enabled true",
+    "⏸ Disable Autopilot": "/set_autopilot_enabled false",
     "🐺 Real Status": "/real_status",
     "🧪 Dry Run Status": "/dry_run_status",
     "🔍 Mainnet Check": "/mainnet_check",
@@ -502,6 +513,28 @@ def dispatch_command(
         send_with_keyboard(telegram, api_mode_text(storage, private_client, args), build_setups_trading_menu_keyboard())
     elif command == "/api_reload":
         send_with_keyboard(telegram, api_reload_text(storage, private_client), build_setups_trading_menu_keyboard())
+    elif command == "/fees":
+        send_with_keyboard(telegram, fees_text(storage), build_trading_fees_menu_keyboard())
+    elif command == "/set_fees":
+        send_with_keyboard(telegram, set_fees_text(storage, args), build_trading_fees_menu_keyboard())
+    elif command == "/set_fee_mode":
+        send_with_keyboard(telegram, set_fee_mode_text(storage, args), build_trading_fees_menu_keyboard())
+    elif command == "/runtime_status":
+        send_with_keyboard(telegram, runtime_status_text(storage, private_client), build_trading_runtime_menu_keyboard())
+    elif command == "/set_trading_enabled":
+        send_with_keyboard(telegram, set_trading_enabled_text(storage, private_client, args), build_trading_runtime_menu_keyboard())
+    elif command == "/set_testnet":
+        send_with_keyboard(telegram, set_testnet_text(storage, private_client, args), build_trading_runtime_menu_keyboard())
+    elif command == "/set_autopilot_enabled":
+        send_with_keyboard(telegram, set_autopilot_enabled_text(storage, private_client, args), build_trading_runtime_menu_keyboard())
+    elif command == "/set_scan_interval":
+        send_with_keyboard(telegram, set_scan_interval_text(storage, args), build_trading_runtime_menu_keyboard())
+    elif command == "/set_max_active_orders":
+        send_with_keyboard(telegram, set_max_active_orders_text(storage, args), build_trading_runtime_menu_keyboard())
+    elif command == "/set_risk_percent":
+        send_with_keyboard(telegram, set_risk_percent_text(storage, args), build_trading_runtime_menu_keyboard())
+    elif command == "/set_paper_balance":
+        send_with_keyboard(telegram, set_paper_balance_text(storage, args), build_trading_runtime_menu_keyboard())
     elif command == "/real_status":
         send_with_keyboard(telegram, real_status_text(storage, private_client), build_setups_trading_menu_keyboard())
     elif command == "/dry_run_status":
@@ -612,6 +645,10 @@ def handle_callback_query(
         edit_menu_message(telegram, message, "🔑 API", build_trading_api_menu_keyboard())
     elif data == "menu:trading_risk":
         edit_menu_message(telegram, message, "🛡 Risk", build_trading_risk_menu_keyboard())
+    elif data == "menu:trading_fees":
+        edit_menu_message(telegram, message, "💸 Fees", build_trading_fees_menu_keyboard())
+    elif data == "menu:trading_runtime":
+        edit_menu_message(telegram, message, "⚙️ Runtime", build_trading_runtime_menu_keyboard())
     elif data == "menu:trading_emergency":
         edit_menu_message(telegram, message, "🚨 Emergency", build_trading_emergency_menu_keyboard())
     elif data == "menu:trading_autopilot":
@@ -942,7 +979,7 @@ def dry_run_order_text(
             if rr_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
                 reject_reasons.append("R/R ниже минимального порога")
             position_size_usdt = qty * entry
-            fee = position_size_usdt * config.BYBIT_TAKER_FEE_RATE * 2
+            fee = position_size_usdt * _runtime_fee_rate() * 2
             slippage = position_size_usdt * (config.SLIPPAGE_PERCENT / 100)
             max_loss_usdt = risk_usdt + fee + slippage
             tp1_profit_usdt = _dry_run_profit_usdt(side, entry, tp1, position_size_usdt) - fee - slippage
@@ -993,6 +1030,15 @@ def trade_permission_label(storage: Storage, private_client: BybitPrivateClient)
     if private_client.testnet:
         return "testnet only"
     return "unknown"
+
+
+def _runtime_fee_rate() -> float:
+    mode = str(getattr(config, "FEE_MODE", config.DEFAULT_EXECUTION_FEE_MODE) or "maker").lower()
+    if mode == "maker":
+        return config.BYBIT_MAKER_FEE_RATE
+    if mode == "worst_case":
+        return max(config.BYBIT_MAKER_FEE_RATE, config.BYBIT_TAKER_FEE_RATE)
+    return config.BYBIT_TAKER_FEE_RATE
 
 
 def api_help_text() -> str:
@@ -1121,6 +1167,13 @@ def handle_api_set_credentials(
         build_trading_api_menu_keyboard(),
     )
     send_with_keyboard(telegram, api_test_text(storage, private_client), build_trading_api_menu_keyboard())
+    checks = run_private_api_checks(private_client)
+    if checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]:
+        send_with_keyboard(
+            telegram,
+            "API готов. Можно включить TESTNET trading через /set_trading_enabled true",
+            build_trading_api_menu_keyboard(),
+        )
 
 
 def api_clear_text(storage: Storage, private_client: BybitPrivateClient) -> str:
@@ -1141,6 +1194,8 @@ def api_mode_text(
     if not args or args[0].lower() not in {"testnet", "mainnet"}:
         return "Использование: /api_mode testnet или /api_mode mainnet"
     mode = "MAINNET" if args[0].lower() == "mainnet" else "TESTNET"
+    storage.save_runtime_state("BYBIT_TESTNET", mode == "TESTNET")
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
     if private_client.credential_source == "TELEGRAM_DB":
         storage.update_active_api_mode(mode)
         private_client.load_credentials(storage)
@@ -1205,8 +1260,8 @@ def api_set_pending_for_message(storage: Storage, message: dict[str, Any]) -> bo
 
 def api_reload_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     private_client.reload_from_environment()
-    if private_client.credential_source == "NONE":
-        private_client.load_credentials(storage)
+    storage.apply_runtime_config_overrides()
+    private_client.load_credentials(storage)
     logging.getLogger("APIControl").info("API config reload requested")
     return "\n".join(
         [
@@ -1218,6 +1273,212 @@ def api_reload_text(storage: Storage, private_client: BybitPrivateClient) -> str
             "Для применения Render Environment нужен redeploy.",
         ]
     )
+
+
+def fees_text(storage: Storage) -> str:
+    settings = storage.get_fee_settings()
+    return "\n".join(
+        [
+            "💸 Fee Profile",
+            "",
+            "Derivatives:",
+            f"Taker: {float(settings['derivatives_taker_fee_percent']):.4f}%",
+            f"Maker: {float(settings['derivatives_maker_fee_percent']):.4f}%",
+            "",
+            "Spot:",
+            f"Taker: {float(settings['spot_taker_fee_percent']):.4f}%",
+            f"Maker: {float(settings['spot_maker_fee_percent']):.4f}%",
+            "",
+            f"Current calculation mode: {settings['fee_mode']}",
+            "",
+            "Used in:",
+            "- order plan",
+            "- estimated net R",
+            "- analytics",
+            "- backtest",
+            "- paper/testnet results",
+        ]
+    )
+
+
+def set_fees_text(storage: Storage, args: list[str]) -> str:
+    if len(args) != 2:
+        return "Использование: /set_fees DERIV_TAKER DERIV_MAKER\nПример: /set_fees 0.1000 0.0360"
+    taker = _to_float(args[0])
+    maker = _to_float(args[1])
+    if taker is None or maker is None or taker < 0 or maker < 0 or taker > 2 or maker > 2:
+        return "❌ Fee values rejected. Укажи проценты от 0 до 2."
+    storage.save_fee_settings(
+        {
+            "derivatives_taker_fee_percent": taker,
+            "derivatives_maker_fee_percent": maker,
+        }
+    )
+    logging.getLogger("RuntimeControl").info("Fee profile updated taker=%.4f maker=%.4f", taker, maker)
+    return fees_text(storage)
+
+
+def set_fee_mode_text(storage: Storage, args: list[str]) -> str:
+    if not args or args[0].lower() not in {"maker", "taker", "worst_case"}:
+        return "Использование: /set_fee_mode maker|taker|worst_case"
+    mode = args[0].lower()
+    storage.save_fee_settings({"fee_mode": mode})
+    logging.getLogger("RuntimeControl").info("Fee mode updated mode=%s", mode)
+    return fees_text(storage)
+
+
+def runtime_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    private_client.load_credentials(storage)
+    checks = run_private_api_checks(private_client) if private_client.can_call_private else {
+        "balance_ok": False,
+        "positions_ok": False,
+        "orders_ok": False,
+        "errors": ["Bybit API keys не настроены."],
+    }
+    api_ok = checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]
+    return "\n".join(
+        [
+            "⚙️ Runtime Status",
+            "",
+            f"Mode: {private_client.market_mode_label()}",
+            f"Trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+            f"Source: {storage.runtime_setting_source('BYBIT_TRADING_ENABLED')}",
+            f"Autopilot enabled: {str(storage.get_runtime_state('TESTNET_AUTOPILOT_ENABLED', config.TESTNET_AUTOPILOT_ENABLED)).lower()}",
+            f"Scan interval: {config.SCAN_INTERVAL_SECONDS}",
+            f"Risk per trade: {config.ACCOUNT_RISK_PERCENT:g}%",
+            f"Paper balance: {config.PAPER_ACCOUNT_BALANCE_USDT:g} USDT",
+            f"Real trading unlocked: {str(real_trading_unlocked(storage)).lower()}",
+            f"Effective real trading: {str(effective_real_trading(storage, private_client)).lower()}",
+            f"API status: {'OK' if api_ok else 'ERROR'}",
+        ]
+    )
+
+
+def set_trading_enabled_text(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    args: list[str],
+) -> str:
+    value = _parse_bool_arg(args)
+    if value is None:
+        return "Использование: /set_trading_enabled true|false"
+    if value and not private_client.testnet:
+        if not real_trading_unlocked(storage):
+            return REAL_LOCK_PHRASE
+        return "MAINNET trading нельзя включить через runtime toggle. Используй Real Gate flow."
+    storage.save_runtime_state("BYBIT_TRADING_ENABLED", value)
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+    private_client.load_credentials(storage)
+    logging.getLogger("RuntimeControl").warning("Runtime BYBIT_TRADING_ENABLED set to %s", value)
+    if value and private_client.testnet:
+        return "🧪 TESTNET trading enabled.\nReal trading remains locked."
+    if not value:
+        return "🔒 Trading disabled. Paper mode allowed."
+    return "Trading enabled."
+
+
+def set_testnet_text(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    args: list[str],
+) -> str:
+    value = _parse_bool_arg(args)
+    if value is None:
+        return "Использование: /set_testnet true|false"
+    storage.save_runtime_state("BYBIT_TESTNET", value)
+    mode = "TESTNET" if value else "MAINNET"
+    if private_client.credential_source == "TELEGRAM_DB":
+        storage.update_active_api_mode(mode)
+        private_client.load_credentials(storage)
+    else:
+        private_client.set_mode(mode)
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+    logging.getLogger("RuntimeControl").warning("Runtime BYBIT_TESTNET set to %s", value)
+    if value:
+        return "✅ Runtime mode set to TESTNET"
+    return "⚠️ Runtime mode set to MAINNET.\nReal trading is still LOCKED."
+
+
+def set_autopilot_enabled_text(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    args: list[str],
+) -> str:
+    value = _parse_bool_arg(args)
+    if value is None:
+        return "Использование: /set_autopilot_enabled true|false"
+    if not value:
+        storage.save_runtime_state("TESTNET_AUTOPILOT_ENABLED", False)
+        return "⏸ TESTNET Autopilot disabled."
+    if not private_client.testnet:
+        return "TESTNET Autopilot works only in TESTNET mode."
+    if not config.BYBIT_TRADING_ENABLED:
+        return "❌ TESTNET Autopilot не включён: сначала /set_trading_enabled true."
+    checks = run_private_api_checks(private_client)
+    if not (checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]):
+        return "❌ TESTNET Autopilot не включён: API test failed."
+    storage.save_runtime_state("TESTNET_AUTOPILOT_ENABLED", True)
+    storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
+    logging.getLogger("RuntimeControl").warning("Runtime TESTNET_AUTOPILOT_ENABLED set to true")
+    return "🧪 TESTNET Autopilot enabled.\nReal trading remains locked."
+
+
+def set_scan_interval_text(storage: Storage, args: list[str]) -> str:
+    value = _parse_int_arg(args)
+    if value is None or value < 10 or value > 3600:
+        return "Использование: /set_scan_interval SECONDS\nДиапазон: 10..3600"
+    storage.save_runtime_state("SCAN_INTERVAL_SECONDS", value)
+    return f"✅ Scan interval set to {value} sec."
+
+
+def set_max_active_orders_text(storage: Storage, args: list[str]) -> str:
+    value = _parse_int_arg(args)
+    if value is None or value < 1 or value > 20:
+        return "Использование: /set_max_active_orders NUMBER\nДиапазон: 1..20"
+    storage.save_runtime_state("TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS", value)
+    return f"✅ Max active TESTNET autopilot orders set to {value}."
+
+
+def set_risk_percent_text(storage: Storage, args: list[str]) -> str:
+    value = _parse_float_arg(args)
+    if value is None or value <= 0 or value > 5:
+        return "Использование: /set_risk_percent NUMBER\nДиапазон: 0.01..5"
+    storage.save_runtime_state("ACCOUNT_RISK_PERCENT", value)
+    return f"✅ Risk per trade set to {value:g}%."
+
+
+def set_paper_balance_text(storage: Storage, args: list[str]) -> str:
+    value = _parse_float_arg(args)
+    if value is None or value <= 0 or value > 1_000_000:
+        return "Использование: /set_paper_balance NUMBER"
+    storage.save_runtime_state("PAPER_ACCOUNT_BALANCE_USDT", value)
+    return f"✅ Paper balance set to {value:g} USDT."
+
+
+def _parse_bool_arg(args: list[str]) -> bool | None:
+    if len(args) != 1:
+        return None
+    value = args[0].strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _parse_int_arg(args: list[str]) -> int | None:
+    if len(args) != 1:
+        return None
+    try:
+        return int(args[0])
+    except ValueError:
+        return None
+
+
+def _parse_float_arg(args: list[str]) -> float | None:
+    if len(args) != 1:
+        return None
+    return _to_float(args[0])
 
 
 def real_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:

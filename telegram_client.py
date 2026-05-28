@@ -99,6 +99,8 @@ def build_setups_trading_menu_keyboard() -> dict[str, Any]:
             [{"text": "📋 Orders", "callback_data": "menu:trading_orders"}],
             [{"text": "🔑 API", "callback_data": "menu:trading_api"}],
             [{"text": "🛡 Risk", "callback_data": "menu:trading_risk"}],
+            [{"text": "💸 Fees", "callback_data": "menu:trading_fees"}],
+            [{"text": "⚙️ Runtime", "callback_data": "menu:trading_runtime"}],
             [{"text": "🚨 Emergency", "callback_data": "menu:trading_emergency"}],
             [{"text": "🤖 Autopilot", "callback_data": "menu:trading_autopilot"}],
             [{"text": "🐺 Real Gate", "callback_data": "menu:trading_real"}],
@@ -131,6 +133,34 @@ def build_trading_api_menu_keyboard() -> dict[str, Any]:
             [{"text": "🔁 Mode Mainnet", "callback_data": "cmd:/api_mode mainnet"}],
             [{"text": "🔄 API Reload", "callback_data": "cmd:/api_reload"}],
             [{"text": "📘 API Help", "callback_data": "cmd:/api_help"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_fees_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "💸 Fee Status", "callback_data": "cmd:/fees"}],
+            [{"text": "🧾 Set My Fees", "callback_data": "cmd:/set_fees 0.1000 0.0360"}],
+            [{"text": "Maker Mode", "callback_data": "cmd:/set_fee_mode maker"}],
+            [{"text": "Taker Mode", "callback_data": "cmd:/set_fee_mode taker"}],
+            [{"text": "Worst Case Mode", "callback_data": "cmd:/set_fee_mode worst_case"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_runtime_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "⚙️ Runtime Status", "callback_data": "cmd:/runtime_status"}],
+            [{"text": "🧪 Enable Testnet Trading", "callback_data": "cmd:/set_trading_enabled true"}],
+            [{"text": "🔒 Disable Trading", "callback_data": "cmd:/set_trading_enabled false"}],
+            [{"text": "🤖 Enable Autopilot", "callback_data": "cmd:/set_autopilot_enabled true"}],
+            [{"text": "⏸ Disable Autopilot", "callback_data": "cmd:/set_autopilot_enabled false"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
