@@ -40,6 +40,7 @@ class MarketScanner:
         self.telegram = telegram
         self.logger = logging.getLogger(self.__class__.__name__)
         self.autopilot_handler = None
+        self.autopilot_setup_handler = None
 
     def refresh_symbols_if_needed(self, force: bool = False) -> None:
         now = int(time.time())
@@ -167,7 +168,6 @@ class MarketScanner:
                 )
                 self._record_alert(enriched_alert["symbol"], timestamp)
                 self._track_setup_if_actionable(enriched_alert)
-                self._run_autopilot_if_enabled(enriched_alert)
                 sent += 1
             except Exception as exc:
                 self.logger.error("Failed to send alert for %s: %s", alert["symbol"], exc)
@@ -934,6 +934,8 @@ class MarketScanner:
             try:
                 reply_markup = build_bybit_chart_keyboard(symbol) if symbol else None
                 self.telegram.send_message(message, reply_markup=reply_markup)
+                if event.get("event") == "ENTERED" and self.autopilot_setup_handler is not None:
+                    self.autopilot_setup_handler(event.get("setup") or {})
             except Exception as exc:
                 self.logger.error("Failed to send setup tracking notification for %s: %s", symbol, exc)
 

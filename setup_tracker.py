@@ -279,6 +279,10 @@ def update_active_setups(bybit_client: Any, storage: Any) -> list[dict[str, Any]
                 latest_price,
                 latest_candle,
             )
+            if setup.get("execution_quality") in {"FAST_MOVE", "MAYBE_NOT_EXECUTABLE", "AMBIGUOUS"}:
+                for setup_event in setup_events:
+                    if setup_event.get("event") == "ENTERED":
+                        setup_event.setdefault("setup", {})["execution_quality"] = setup.get("execution_quality")
             setup["last_checked_at"] = _iso_now()
 
             final_event = None

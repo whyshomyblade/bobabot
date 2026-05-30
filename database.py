@@ -159,15 +159,19 @@ class BotDatabase:
                     alert_type TEXT,
                     risk_level TEXT,
                     execution_quality TEXT,
+                    setup_status TEXT,
                     decision TEXT,
                     reason TEXT,
                     order_id TEXT,
+                    order_link_id TEXT,
                     setup_id TEXT,
                     mode TEXT,
+                    raw_context_json TEXT,
                     data TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_autopilot_decision_columns()
             self._ensure_paper_order_columns()
 
     def close(self) -> None:
@@ -518,6 +522,24 @@ class BotDatabase:
     def count_paper_orders(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0])
 
+    def _ensure_autopilot_decision_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(autopilot_decisions)").fetchall()
+        }
+        migrations = {
+            "setup_status": "TEXT",
+            "order_link_id": "TEXT",
+            "raw_context_json": "TEXT",
+        }
+        for name, column_type in migrations.items():
+            if name in columns:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE autopilot_decisions ADD COLUMN {name} {column_type}"
+            )
+            self.logger.info("Added autopilot_decisions.%s column", name)
+
     def add_autopilot_decision(self, record: dict[str, Any]) -> dict[str, Any]:
         record_id = str(record.get("id") or f"auto_dec_{uuid.uuid4().hex}")
         created_at = str(record.get("created_at") or self._now())
@@ -528,8 +550,9 @@ class BotDatabase:
                 """
                 INSERT OR REPLACE INTO autopilot_decisions
                     (id, created_at, symbol, side, alert_type, risk_level,
-                     execution_quality, decision, reason, order_id, setup_id, mode, data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     execution_quality, setup_status, decision, reason, order_id,
+                     order_link_id, setup_id, mode, raw_context_json, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -539,11 +562,14 @@ class BotDatabase:
                     record.get("alert_type"),
                     record.get("risk_level"),
                     record.get("execution_quality"),
+                    record.get("setup_status"),
                     record.get("decision"),
                     record.get("reason"),
                     record.get("order_id"),
+                    record.get("order_link_id"),
                     record.get("setup_id"),
                     record.get("mode"),
+                    self._dumps(record.get("raw_context_json") or record.get("raw_context") or {}),
                     self._dumps(record),
                 ),
             )

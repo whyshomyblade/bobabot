@@ -52,6 +52,7 @@ from storage import Storage
 from testnet_autopilot import (
     TestnetAutopilot,
     autopilot_block_reasons,
+    autopilot_debug_last_text,
     autopilot_enabled,
     autopilot_journal_text,
     autopilot_rules_text,
@@ -140,6 +141,7 @@ BUTTON_COMMANDS = {
     "⏸ Disable Autopilot": "/autopilot_off",
     "📜 Rules": "/autopilot_rules",
     "📒 Journal": "/autopilot_journal",
+    "🧪 Debug Last": "/autopilot_debug_last",
     "🔄 Sync Orders": "/sync_orders",
     "❌ Cancel All": "/cancel_all",
     "🚫 Cancel All TESTNET": "/cancel_all_testnet",
@@ -569,6 +571,8 @@ def dispatch_command(
         send_with_keyboard(telegram, autopilot_rules_text(), build_trading_autopilot_menu_keyboard())
     elif command == "/autopilot_journal":
         send_with_keyboard(telegram, autopilot_journal_text(storage), build_trading_autopilot_menu_keyboard())
+    elif command == "/autopilot_debug_last":
+        send_with_keyboard(telegram, autopilot_debug_last_text(storage, private_client), build_trading_autopilot_menu_keyboard())
     elif command == "/cancel_order":
         send_with_keyboard(telegram, cancel_order_text(storage, private_client, args), build_setups_trading_menu_keyboard())
     elif command == "/cancel_all_testnet":
@@ -3212,6 +3216,7 @@ async def main_async() -> None:
     scanner = MarketScanner(bybit, storage, telegram)
     autopilot = TestnetAutopilot(storage, private_client, telegram)
     scanner.autopilot_handler = autopilot.handle_alert
+    scanner.autopilot_setup_handler = autopilot.maybe_run_testnet_autopilot
 
     logger.info("Starting Bybit Futures Radar")
     if config.HOSTING_MODE:

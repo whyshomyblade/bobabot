@@ -201,6 +201,7 @@ def build_trading_autopilot_menu_keyboard() -> dict[str, Any]:
             [{"text": "⏸ Disable Autopilot", "callback_data": "cmd:/autopilot_off"}],
             [{"text": "📜 Rules", "callback_data": "cmd:/autopilot_rules"}],
             [{"text": "📒 Journal", "callback_data": "cmd:/autopilot_journal"}],
+            [{"text": "🧪 Debug Last", "callback_data": "cmd:/autopilot_debug_last"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
