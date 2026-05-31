@@ -12,6 +12,7 @@ def build_order_plan_from_alert(
     leverage: int = config.DEFAULT_LEVERAGE,
     has_existing_order: bool = False,
     has_existing_position: bool = False,
+    ignore_min_rr: bool = False,
 ) -> dict[str, Any]:
     setup = _setup_view(alert)
     symbol = str(alert.get("symbol") or "")
@@ -106,9 +107,9 @@ def build_order_plan_from_alert(
     net_r_tp2 = tp2_profit_usdt / gross_risk_usdt if gross_risk_usdt > 0 else 0
     net_r_stop = -max_loss_usdt / gross_risk_usdt if gross_risk_usdt > 0 else -1
 
-    if rr_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
+    if not ignore_min_rr and rr_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
         return _reject(base_plan, "R/R ниже минимального порога")
-    if net_r_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
+    if not ignore_min_rr and net_r_tp1 < config.MIN_RR_TO_ALLOW_ORDER:
         return _reject(base_plan, "R/R после комиссий ниже минимума")
 
     base_plan.update(

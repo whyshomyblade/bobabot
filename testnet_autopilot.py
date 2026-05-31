@@ -108,10 +108,23 @@ class TestnetAutopilot:
             self.storage.save_runtime_state("last_autopilot_decision", decision)
             return
 
+        aggressive = bool(self.private_client.testnet and testnet_aggressive_enabled(self.storage))
+        warnings = autopilot_warnings(setup_record) if aggressive else []
+
         try:
-            plan_or_reason = self._build_allowed_plan(setup_record, activated=True)
+            plan_or_reason = self._build_allowed_plan(
+                setup_record,
+                activated=True,
+                aggressive=aggressive,
+            )
             if isinstance(plan_or_reason, str):
-                decision = self._record_decision(setup_record, "REJECTED", plan_or_reason)
+                decision = self._record_decision(
+                    setup_record,
+                    "REJECTED",
+                    plan_or_reason,
+                    aggressive_mode=aggressive,
+                    warnings=warnings,
+                )
                 self._mark_setup_decided(setup_id, decision)
                 self.storage.save_runtime_state("last_autopilot_decision", decision)
                 LOGGER.warning(
@@ -123,6 +136,13 @@ class TestnetAutopilot:
                 return
 
             plan = plan_or_reason
+            plan_rr = to_float(plan.get("rr_tp1"))
+            if aggressive and plan_rr is not None and plan_rr < config.TESTNET_AUTOPILOT_MIN_RR:
+                rr_warning = f"R/R below normal autopilot minimum: {plan_rr:.2f}R"
+                if rr_warning not in warnings:
+                    warnings.append(rr_warning)
+            plan["aggressive_mode"] = aggressive
+            plan["warnings"] = warnings
             order_link_id = f"bobabot-auto-{uuid.uuid4().hex[:18]}"
             response = self.private_client.place_limit_order(
                 symbol=str(plan.get("symbol")),
@@ -161,6 +181,8 @@ class TestnetAutopilot:
                 order_id=result.get("orderId") or local_order_id,
                 order_link_id=order_link_id,
                 plan=plan,
+                aggressive_mode=aggressive,
+                warnings=warnings,
             )
             self._mark_setup_decided(setup_id, decision)
             self.storage.save_runtime_state("last_autopilot_decision", decision)
@@ -173,18 +195,36 @@ class TestnetAutopilot:
             self.telegram.send_message(format_autopilot_sent_message(plan, decision))
         except Exception as exc:
             reason = sanitize_error(exc)
-            decision = self._record_decision(setup_record, "REJECTED", reason)
+            decision = self._record_decision(
+                setup_record,
+                "REJECTED",
+                reason,
+                aggressive_mode=aggressive,
+                warnings=warnings,
+            )
             self._mark_setup_decided(setup_id, decision)
             self.storage.save_runtime_state("last_autopilot_decision", decision)
             LOGGER.error("Autopilot activated hook failed symbol=%s error=%s", setup_record.get("symbol"), reason)
             self.telegram.send_message(format_autopilot_rejected_message(setup_record, reason))
 
-    def _build_allowed_plan(self, alert_record: dict[str, Any], activated: bool = False) -> dict[str, Any] | str:
-        base_reasons = autopilot_block_reasons(self.storage, self.private_client)
+    def _build_allowed_plan(
+        self,
+        alert_record: dict[str, Any],
+        activated: bool = False,
+        aggressive: bool = False,
+    ) -> dict[str, Any] | str:
+        base_reasons = autopilot_block_reasons(
+            self.storage,
+            self.private_client,
+            aggressive=aggressive,
+        )
         if base_reasons:
             return base_reasons[0]
 
-        alert_reason = activated_setup_rejection(alert_record) if activated else alert_whitelist_rejection(alert_record)
+        if activated and aggressive:
+            alert_reason = technical_setup_rejection(alert_record)
+        else:
+            alert_reason = activated_setup_rejection(alert_record) if activated else alert_whitelist_rejection(alert_record)
         if alert_reason:
             return alert_reason
 
@@ -216,19 +256,30 @@ class TestnetAutopilot:
         except Exception as exc:
             return f"balance read failed: {sanitize_error(exc)}"
 
+        plan_record = aggressive_plan_view(alert_record) if aggressive else alert_record
         plan = build_order_plan_from_alert(
-            alert=alert_record,
+            alert=plan_record,
             instrument_info=instrument_info,
             account_balance_usdt=balance,
             leverage=config.DEFAULT_LEVERAGE,
             has_existing_order=False,
             has_existing_position=False,
+            ignore_min_rr=aggressive,
         )
         if not plan.get("allowed"):
             reasons = plan.get("reasons") or ["risk validation rejected"]
             return str(reasons[0])
-        if (to_float(plan.get("rr_tp1")) or 0) < config.TESTNET_AUTOPILOT_MIN_RR:
+        if not aggressive and (to_float(plan.get("rr_tp1")) or 0) < config.TESTNET_AUTOPILOT_MIN_RR:
             return "autopilot R/R below minimum"
+        if aggressive:
+            plan.update(
+                {
+                    "risk_level": alert_record.get("risk_level"),
+                    "execution_quality": normalized_execution_quality(alert_record),
+                    "execution_status": alert_record.get("execution_status"),
+                    "setup_status": alert_record.get("setup_status") or alert_record.get("state"),
+                }
+            )
         return plan
 
     def _record_decision(
@@ -239,8 +290,11 @@ class TestnetAutopilot:
         order_id: str | None = None,
         order_link_id: str | None = None,
         plan: dict[str, Any] | None = None,
+        aggressive_mode: bool = False,
+        warnings: list[str] | None = None,
     ) -> dict[str, Any]:
         side = (plan or {}).get("side") or direction_from_bias(alert_record.get("setup_bias"))
+        warnings = list(warnings or [])
         record = {
             "id": f"auto_dec_{uuid.uuid4().hex}",
             "created_at": utc_now_iso(),
@@ -256,6 +310,9 @@ class TestnetAutopilot:
             "order_link_id": order_link_id or (plan or {}).get("order_link_id"),
             "setup_id": alert_record.get("source_setup_id") or alert_record.get("id"),
             "mode": "TESTNET",
+            "aggressive_mode": aggressive_mode,
+            "warnings": warnings,
+            "warnings_json": warnings,
             "source_alert_id": alert_record.get("id"),
             "rr_tp1": (plan or {}).get("rr_tp1"),
             "entry_price": (plan or {}).get("entry_price"),
@@ -275,7 +332,65 @@ def autopilot_enabled(storage: Any) -> bool:
     return bool(storage.get_runtime_state("TESTNET_AUTOPILOT_ENABLED", config.TESTNET_AUTOPILOT_ENABLED))
 
 
-def autopilot_block_reasons(storage: Any, private_client: Any) -> list[str]:
+def testnet_aggressive_enabled(storage: Any) -> bool:
+    return bool(storage.get_runtime_state("TESTNET_AGGRESSIVE_MODE", config.TESTNET_AGGRESSIVE_MODE))
+
+
+def set_testnet_aggressive_mode_text(storage: Any, enabled: bool) -> str:
+    storage.save_runtime_state("TESTNET_AGGRESSIVE_MODE", enabled)
+    LOGGER.warning("TESTNET aggressive mode set to %s", enabled)
+    if enabled:
+        return "\n".join(
+            [
+                "🧪 TESTNET Aggressive Mode: ON",
+                "",
+                "Автопилот будет отправлять TESTNET лимитки по каждому активированному сетапу, если это технически возможно.",
+                "HIGH/EXTREME, FAST_MOVE, whitelist и TOO_LATE станут warnings, а не стопорами.",
+                "",
+                "Real market: NO",
+            ]
+        )
+    return "\n".join(
+        [
+            "🧊 TESTNET Aggressive Mode: OFF",
+            "",
+            "Автопилот снова использует обычные whitelist/risk/execution фильтры.",
+            "Real market: NO",
+        ]
+    )
+
+
+def testnet_aggressive_status_text(storage: Any, private_client: Any) -> str:
+    aggressive = testnet_aggressive_enabled(storage)
+    reasons = autopilot_block_reasons(storage, private_client, aggressive=aggressive)
+    lines = [
+        "🧪 TESTNET Aggressive Status",
+        "",
+        f"Aggressive mode: {'ON' if aggressive else 'OFF'}",
+        f"Autopilot enabled: {str(autopilot_enabled(storage)).lower()}",
+        f"Mode: {'TESTNET' if private_client.testnet else 'MAINNET'}",
+        f"Trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+        "Real market: NO",
+        "",
+        "Hard blockers:",
+    ]
+    lines.extend(f"- {reason}" for reason in reasons)
+    if not reasons:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "When ON, these become warnings instead of blockers:",
+            "- HIGH / EXTREME risk",
+            "- FAST_MOVE / MAYBE_NOT_EXECUTABLE / AMBIGUOUS",
+            "- alert type whitelist",
+            "- TOO_LATE_DO_NOT_CHASE",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def autopilot_block_reasons(storage: Any, private_client: Any, aggressive: bool = False) -> list[str]:
     reasons = []
     if not autopilot_enabled(storage):
         reasons.append("TESTNET_AUTOPILOT_ENABLED=false")
@@ -293,9 +408,9 @@ def autopilot_block_reasons(storage: Any, private_client: Any) -> list[str]:
         reasons.append("daily loss limit reached")
     if storage.get_runtime_state("order_lifecycle_unstable", False):
         reasons.append("order lifecycle unstable")
-    if orders_today(storage) >= config.TESTNET_AUTOPILOT_MAX_ORDERS_PER_DAY:
+    if not aggressive and orders_today(storage) >= config.TESTNET_AUTOPILOT_MAX_ORDERS_PER_DAY:
         reasons.append("max autopilot orders per day reached")
-    if active_testnet_orders(storage) >= config.TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS:
+    if not aggressive and active_testnet_orders(storage) >= config.TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS:
         reasons.append("max active TESTNET orders reached")
     if not reasons:
         checks = run_private_api_checks(private_client)
@@ -362,13 +477,63 @@ def activated_setup_rejection(alert_record: dict[str, Any]) -> str | None:
     return None
 
 
+def technical_setup_rejection(alert_record: dict[str, Any]) -> str | None:
+    setup_status = str(alert_record.get("setup_status") or alert_record.get("state") or "")
+    if setup_status not in {"ENTERED", "ACTIVE", "ACTIVATED", "ВХОД АКТИВИРОВАН"}:
+        return f"setup status is not activated: {setup_status or 'unknown'}"
+
+    if direction_from_bias(alert_record.get("setup_bias")) not in {"LONG", "SHORT"}:
+        return "setup direction missing"
+
+    for field in ("entry_zone", "invalidation", "tp1", "tp2"):
+        if alert_record.get(field) in {None, "", "n/a"}:
+            return f"{field} missing"
+    return None
+
+
+def aggressive_plan_view(alert_record: dict[str, Any]) -> dict[str, Any]:
+    plan_record = dict(alert_record)
+    plan_record["risk_level"] = "MEDIUM"
+    plan_record["execution_quality"] = "REALISTIC"
+    plan_record["execution_status"] = "ENTERABLE_NOW"
+    plan_record["setup_status"] = "ENTERED"
+    return plan_record
+
+
+def autopilot_warnings(alert_record: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    alert_type = str(alert_record.get("alert_type") or "")
+    allowed = {item.lower() for item in config.TESTNET_AUTOPILOT_ALLOWED_ALERT_TYPES}
+    if alert_type and alert_type.lower() not in allowed:
+        warnings.append(f"Alert type outside whitelist: {alert_type}")
+
+    risk_level = str(alert_record.get("risk_level") or "unknown")
+    if risk_level in {"HIGH", "EXTREME"}:
+        warnings.append(f"Risk level warning: {risk_level}")
+
+    execution_quality = normalized_execution_quality(alert_record)
+    if execution_quality in {"FAST_MOVE", "MAYBE_NOT_EXECUTABLE", "AMBIGUOUS"}:
+        warnings.append(f"Execution quality warning: {execution_quality}")
+
+    execution_status = str(alert_record.get("execution_status") or "")
+    if execution_status in {"TOO_LATE_DO_NOT_CHASE", "NO_SETUP"}:
+        warnings.append(f"Execution status warning: {execution_status}")
+
+    rr = to_float(alert_record.get("rr_tp1"))
+    if rr is not None and rr < config.TESTNET_AUTOPILOT_MIN_RR:
+        warnings.append(f"R/R below normal autopilot minimum: {rr:.2f}R")
+    return warnings
+
+
 def autopilot_status_text(storage: Any, private_client: Any) -> str:
-    reasons = autopilot_block_reasons(storage, private_client)
+    aggressive = testnet_aggressive_enabled(storage)
+    reasons = autopilot_block_reasons(storage, private_client, aggressive=aggressive)
     lines = [
         "🤖 TESTNET Autopilot Status",
         "",
         f"Enabled: {str(autopilot_enabled(storage)).lower()}",
         f"Mode: {'TESTNET' if private_client.testnet else 'MAINNET'}",
+        f"Aggressive mode: {'ON' if aggressive else 'OFF'}",
         f"Strict whitelist: {str(config.STRICT_ALERT_TYPE_WHITELIST).lower()}",
         f"Orders today: {orders_today(storage)} / {config.TESTNET_AUTOPILOT_MAX_ORDERS_PER_DAY}",
         f"Active orders: {active_testnet_orders(storage)} / {config.TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS}",
@@ -379,6 +544,15 @@ def autopilot_status_text(storage: Any, private_client: Any) -> str:
     lines.extend(f"- {reason}" for reason in reasons)
     if not reasons:
         lines.append("- none")
+    if aggressive:
+        lines.extend(
+            [
+                "",
+                "Aggressive mode notes:",
+                "- HIGH/EXTREME, FAST_MOVE, whitelist and TOO_LATE are warnings only.",
+                "- API, panic/runtime blocks, duplicates, active positions and invalid risk/qty still reject.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -394,6 +568,7 @@ def autopilot_rules_text() -> str:
         f"Max orders/day: {config.TESTNET_AUTOPILOT_MAX_ORDERS_PER_DAY}",
         f"Max active orders: {config.TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS}",
         f"Min R/R: {config.TESTNET_AUTOPILOT_MIN_RR:g}",
+        f"Aggressive mode default: {str(config.TESTNET_AGGRESSIVE_MODE).lower()}",
         f"Strict alert type whitelist: {str(config.STRICT_ALERT_TYPE_WHITELIST).lower()}",
         "",
         "Allowed alert types:",
@@ -405,6 +580,12 @@ def autopilot_rules_text() -> str:
             "Real market: NO",
             "Autopilot can only submit TESTNET limit orders.",
             "If strict whitelist is false, activated LOW/MEDIUM REALISTIC setups can pass even when alert type is not whitelisted.",
+            "",
+            "Aggressive mode:",
+            "- TESTNET only.",
+            "- Sends a TESTNET limit order for every activated setup when technically possible.",
+            "- HIGH/EXTREME, FAST_MOVE/AMBIGUOUS, TOO_LATE and whitelist mismatches become warnings.",
+            "- API not ready, panic mode, runtime trading disabled, duplicates, active positions and invalid qty/risk still reject.",
         ]
     )
     return "\n".join(lines)
@@ -426,6 +607,8 @@ def autopilot_journal_text(storage: Any, limit: int = 10) -> str:
                 f"Type: {item.get('alert_type') or 'n/a'}",
                 f"Risk: {item.get('risk_level') or 'n/a'}",
                 f"Execution: {item.get('execution_quality') or 'n/a'}",
+                f"Aggressive: {'ON' if item.get('aggressive_mode') else 'OFF'}",
+                f"Warnings: {format_warnings_inline(item)}",
                 f"Reason: {item.get('reason') or 'n/a'}",
                 f"Time: {format_time(item.get('created_at'))}",
                 "",
@@ -434,22 +617,55 @@ def autopilot_journal_text(storage: Any, limit: int = 10) -> str:
     return "\n".join(lines).rstrip()
 
 
+def normalize_warnings(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                import json
+
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(item) for item in parsed if str(item)]
+            except Exception:
+                return [text]
+        return [text]
+    return []
+
+
+def format_warnings_inline(item: dict[str, Any]) -> str:
+    warnings = normalize_warnings(item.get("warnings") or item.get("warnings_json"))
+    if not warnings:
+        return "none"
+    return "; ".join(warnings[:3]) + ("; ..." if len(warnings) > 3 else "")
+
+
 def format_autopilot_sent_message(plan: dict[str, Any], decision: dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            "🧪 TESTNET AUTOPILOT ORDER SENT",
-            "",
-            f"Symbol: {plan.get('symbol')}",
-            f"Side: {plan.get('side')}",
-            f"Entry: {plan.get('entry_price')}",
-            f"Qty: {plan.get('qty')}",
-            f"Risk: {plan.get('risk_usdt', 0):.2f} USDT",
-            f"Reason: {decision.get('reason') or 'setup activated + autopilot passed'}",
-            f"Order ID: {plan.get('exchange_order_id') or plan.get('order_link_id') or plan.get('id')}",
-            "",
-            "Real market: NO",
-        ]
-    )
+    aggressive = bool(plan.get("aggressive_mode") or decision.get("aggressive_mode"))
+    warnings = normalize_warnings(plan.get("warnings") or decision.get("warnings") or decision.get("warnings_json"))
+    lines = [
+        "🧪 TESTNET AUTOPILOT ORDER SENT",
+        "",
+        f"Symbol: {plan.get('symbol')}",
+        f"Side: {plan.get('side')}",
+        f"Entry: {plan.get('entry_price')}",
+        f"Qty: {plan.get('qty')}",
+        f"Risk: {plan.get('risk_usdt', 0):.2f} USDT",
+        f"Reason: {decision.get('reason') or 'setup activated + autopilot passed'}",
+        f"Order ID: {plan.get('exchange_order_id') or plan.get('order_link_id') or plan.get('id')}",
+        "",
+        "Mode: TESTNET",
+        f"Aggressive mode: {'ON' if aggressive else 'OFF'}",
+        "Real market: NO",
+    ]
+    if warnings:
+        lines.extend(["", "Warnings:"])
+        lines.extend(f"- {warning}" for warning in warnings)
+    return "\n".join(lines)
 
 
 def format_autopilot_rejected_message(setup: dict[str, Any], reason: str) -> str:
@@ -476,7 +692,8 @@ def autopilot_debug_last_text(storage: Any, private_client: Any) -> str:
     api_ok = checks["balance_ok"] and checks["positions_ok"] and checks["orders_ok"]
     symbol = str(setup.get("symbol") or "")
     duplicate = has_duplicate_symbol_order(storage, symbol) if symbol else False
-    risk_ok = not activated_setup_rejection(setup) if setup else False
+    aggressive = testnet_aggressive_enabled(storage)
+    risk_ok = not (technical_setup_rejection(setup) if aggressive else activated_setup_rejection(setup)) if setup else False
     return "\n".join(
         [
             "🧪 Autopilot Debug Last",
@@ -494,6 +711,7 @@ def autopilot_debug_last_text(storage: Any, private_client: Any) -> str:
             "",
             "Autopilot:",
             f"Enabled: {str(autopilot_enabled(storage)).lower()}",
+            f"Aggressive mode: {'ON' if aggressive else 'OFF'}",
             f"Trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
             f"Mode: {'TESTNET' if private_client.testnet else 'MAINNET'}",
             f"API OK: {str(api_ok).lower()}",

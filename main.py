@@ -57,6 +57,8 @@ from testnet_autopilot import (
     autopilot_journal_text,
     autopilot_rules_text,
     autopilot_status_text,
+    set_testnet_aggressive_mode_text,
+    testnet_aggressive_status_text,
 )
 from telegram_client import (
     TelegramClient,
@@ -142,6 +144,9 @@ BUTTON_COMMANDS = {
     "📜 Rules": "/autopilot_rules",
     "📒 Journal": "/autopilot_journal",
     "🧪 Debug Last": "/autopilot_debug_last",
+    "🧪 Aggressive ON": "/testnet_aggressive_on",
+    "🧊 Aggressive OFF": "/testnet_aggressive_off",
+    "🧪 Aggressive Status": "/testnet_aggressive_status",
     "🔄 Sync Orders": "/sync_orders",
     "❌ Cancel All": "/cancel_all",
     "🚫 Cancel All TESTNET": "/cancel_all_testnet",
@@ -294,6 +299,7 @@ def config_text() -> str:
             f"• Max orders/day: {config.TESTNET_AUTOPILOT_MAX_ORDERS_PER_DAY}",
             f"• Max active orders: {config.TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS}",
             f"• Min R/R: {config.TESTNET_AUTOPILOT_MIN_RR:g}",
+            f"• Aggressive mode: {str(config.TESTNET_AGGRESSIVE_MODE).lower()}",
             "",
             "Order Lifecycle:",
             f"• Order sync: {'ON' if config.ORDER_SYNC_ENABLED else 'OFF'}",
@@ -573,6 +579,24 @@ def dispatch_command(
         send_with_keyboard(telegram, autopilot_journal_text(storage), build_trading_autopilot_menu_keyboard())
     elif command == "/autopilot_debug_last":
         send_with_keyboard(telegram, autopilot_debug_last_text(storage, private_client), build_trading_autopilot_menu_keyboard())
+    elif command == "/testnet_aggressive_on":
+        send_with_keyboard(
+            telegram,
+            set_testnet_aggressive_mode_text(storage, True),
+            build_trading_autopilot_menu_keyboard(),
+        )
+    elif command == "/testnet_aggressive_off":
+        send_with_keyboard(
+            telegram,
+            set_testnet_aggressive_mode_text(storage, False),
+            build_trading_autopilot_menu_keyboard(),
+        )
+    elif command == "/testnet_aggressive_status":
+        send_with_keyboard(
+            telegram,
+            testnet_aggressive_status_text(storage, private_client),
+            build_trading_autopilot_menu_keyboard(),
+        )
     elif command == "/cancel_order":
         send_with_keyboard(telegram, cancel_order_text(storage, private_client, args), build_setups_trading_menu_keyboard())
     elif command == "/cancel_all_testnet":

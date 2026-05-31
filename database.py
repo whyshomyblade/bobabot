@@ -166,6 +166,8 @@ class BotDatabase:
                     order_link_id TEXT,
                     setup_id TEXT,
                     mode TEXT,
+                    aggressive_mode INTEGER,
+                    warnings_json TEXT,
                     raw_context_json TEXT,
                     data TEXT NOT NULL
                 )
@@ -531,6 +533,8 @@ class BotDatabase:
             "setup_status": "TEXT",
             "order_link_id": "TEXT",
             "raw_context_json": "TEXT",
+            "aggressive_mode": "INTEGER",
+            "warnings_json": "TEXT",
         }
         for name, column_type in migrations.items():
             if name in columns:
@@ -551,8 +555,9 @@ class BotDatabase:
                 INSERT OR REPLACE INTO autopilot_decisions
                     (id, created_at, symbol, side, alert_type, risk_level,
                      execution_quality, setup_status, decision, reason, order_id,
-                     order_link_id, setup_id, mode, raw_context_json, data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     order_link_id, setup_id, mode, aggressive_mode, warnings_json,
+                     raw_context_json, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -569,6 +574,8 @@ class BotDatabase:
                     record.get("order_link_id"),
                     record.get("setup_id"),
                     record.get("mode"),
+                    1 if record.get("aggressive_mode") else 0,
+                    self._dumps(record.get("warnings_json") or record.get("warnings") or []),
                     self._dumps(record.get("raw_context_json") or record.get("raw_context") or {}),
                     self._dumps(record),
                 ),

@@ -31,6 +31,7 @@ RUNTIME_CONFIG_KEYS = {
     "BYBIT_TRADING_ENABLED",
     "BYBIT_TESTNET",
     "TESTNET_AUTOPILOT_ENABLED",
+    "TESTNET_AGGRESSIVE_MODE",
     "SCAN_INTERVAL_SECONDS",
     "TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS",
     "ACCOUNT_RISK_PERCENT",
@@ -89,6 +90,7 @@ class Storage:
             "REAL_DRY_RUN_ENABLED": config.REAL_DRY_RUN_ENABLED,
             "MAINNET_READ_ONLY_MODE": config.MAINNET_READ_ONLY_MODE,
             "TESTNET_AUTOPILOT_ENABLED": config.TESTNET_AUTOPILOT_ENABLED,
+            "TESTNET_AGGRESSIVE_MODE": config.TESTNET_AGGRESSIVE_MODE,
             "PANIC_MODE": False,
             "RUNTIME_TRADING_DISABLED": False,
             "api_set_pending": False,
@@ -350,6 +352,8 @@ class Storage:
             config.BYBIT_TESTNET = bool(value)
         elif key == "TESTNET_AUTOPILOT_ENABLED":
             config.TESTNET_AUTOPILOT_ENABLED = bool(value)
+        elif key == "TESTNET_AGGRESSIVE_MODE":
+            config.TESTNET_AGGRESSIVE_MODE = bool(value)
         elif key == "SCAN_INTERVAL_SECONDS":
             config.SCAN_INTERVAL_SECONDS = int(value)
         elif key == "TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS":
