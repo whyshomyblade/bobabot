@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import signal
+import subprocess
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -74,6 +75,7 @@ from telegram_client import (
     build_setups_trading_menu_keyboard,
     build_trading_api_menu_keyboard,
     build_trading_autopilot_menu_keyboard,
+    build_trading_cleanup_menu_keyboard,
     build_trading_emergency_menu_keyboard,
     build_trading_fees_menu_keyboard,
     build_trading_orders_menu_keyboard,
@@ -106,6 +108,7 @@ BUTTON_COMMANDS = {
     "📋 Ордера": "/orders",
     "📊 Позиции": "/positions",
     "💰 Баланс": "/balance",
+    "🧩 Upgrade Status": "/upgrade_status",
     "🔑 API Status": "/api_status",
     "🧪 API Test": "/api_test",
     "📘 API Help": "/api_help",
@@ -127,6 +130,8 @@ BUTTON_COMMANDS = {
     "🧪 Enable Testnet Trading": "/set_trading_enabled true",
     "🤖 Enable Autopilot": "/set_autopilot_enabled true",
     "⏸ Disable Autopilot": "/set_autopilot_enabled false",
+    "🧪 Aggressive ON": "/testnet_aggressive_on",
+    "🧊 Aggressive OFF": "/testnet_aggressive_off",
     "🐺 Real Status": "/real_status",
     "🧪 Dry Run Status": "/dry_run_status",
     "🔍 Mainnet Check": "/mainnet_check",
@@ -144,9 +149,13 @@ BUTTON_COMMANDS = {
     "📜 Rules": "/autopilot_rules",
     "📒 Journal": "/autopilot_journal",
     "🧪 Debug Last": "/autopilot_debug_last",
-    "🧪 Aggressive ON": "/testnet_aggressive_on",
-    "🧊 Aggressive OFF": "/testnet_aggressive_off",
     "🧪 Aggressive Status": "/testnet_aggressive_status",
+    "🧹 Cleanup Status": "/cleanup_status",
+    "🧹 Cleanup Now": "/cleanup_now",
+    "✅ Cleanup ON": "/cleanup_on",
+    "⛔ Cleanup OFF": "/cleanup_off",
+    "📋 Real Orders": "/real_orders",
+    "❌ Cancel Real Order Help": "/cancel_real_order",
     "🔄 Sync Orders": "/sync_orders",
     "❌ Cancel All": "/cancel_all",
     "🚫 Cancel All TESTNET": "/cancel_all_testnet",
@@ -207,6 +216,51 @@ def debug_state_text(storage: Storage) -> str:
             f"Hosting mode: {'ON' if config.HOSTING_MODE else 'OFF'}",
         ]
     )
+
+
+def upgrade_status_text(storage: Storage, private_client: BybitPrivateClient) -> str:
+    logging.getLogger("UpgradeStatus").info("Upgrade status checked")
+    private_client.load_credentials(storage)
+    deploy_mode = "Render" if config.HOSTING_MODE or bool(__import__("os").getenv("RENDER")) else "Local"
+    commit = git_commit_hash()
+    runtime_enabled = config.BYBIT_TRADING_ENABLED and not bool(storage.get_runtime_state("RUNTIME_TRADING_DISABLED", False))
+    return "\n".join(
+        [
+            "🧩 Upgrade Status",
+            "",
+            f"Current phase: {config.BOT_PHASE}",
+            f"Build: {config.BOT_BUILD_NAME}",
+            f"Description: {config.BOT_BUILD_DESCRIPTION}",
+            f"Deploy mode: {deploy_mode}",
+            f"Git commit: {commit}",
+            f"Build date: {config.BOT_BUILD_DATE}",
+            f"Mode: {private_client.market_mode_label()}",
+            f"Trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+            f"Runtime trading enabled: {str(runtime_enabled).lower()}",
+            f"Real trading unlocked: {str(real_trading_unlocked(storage)).lower()}",
+            f"Effective real trading: {str(effective_real_trading(storage, private_client)).lower()}",
+            f"TESTNET aggressive mode: {str(storage.get_runtime_state('TESTNET_AGGRESSIVE_MODE', config.TESTNET_AGGRESSIVE_MODE)).lower()}",
+            f"Autopilot: {'enabled' if autopilot_enabled(storage) else 'disabled'}",
+            "Real autopilot: OFF",
+        ]
+    )
+
+
+def git_commit_hash() -> str:
+    if config.BOT_BUILD_ID != "unknown":
+        return config.BOT_BUILD_ID
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
 
 
 def config_text() -> str:
@@ -493,6 +547,8 @@ def dispatch_command(
         send_with_keyboard(telegram, blacklist_remove(storage, args), build_setups_menu_keyboard())
     elif command == "/debug_state":
         send_with_keyboard(telegram, debug_state_text(storage), build_radar_menu_keyboard())
+    elif command in {"/version", "/upgrade_status"}:
+        send_with_keyboard(telegram, upgrade_status_text(storage, private_client), build_setups_trading_menu_keyboard())
     elif command == "/backup_db":
         backup_path = storage.backup_database()
         send_with_keyboard(telegram, f"✅ Бэкап базы создан: {backup_path}", build_settings_menu_keyboard())
@@ -535,6 +591,8 @@ def dispatch_command(
         send_with_keyboard(telegram, set_testnet_text(storage, private_client, args), build_trading_runtime_menu_keyboard())
     elif command == "/set_autopilot_enabled":
         send_with_keyboard(telegram, set_autopilot_enabled_text(storage, private_client, args), build_trading_runtime_menu_keyboard())
+    elif command == "/set_testnet_aggressive":
+        send_with_keyboard(telegram, set_testnet_aggressive_text(storage, args), build_trading_runtime_menu_keyboard())
     elif command == "/set_scan_interval":
         send_with_keyboard(telegram, set_scan_interval_text(storage, args), build_trading_runtime_menu_keyboard())
     elif command == "/set_max_active_orders":
@@ -549,6 +607,16 @@ def dispatch_command(
         send_with_keyboard(telegram, dry_run_status_text(storage, private_client), build_trading_real_menu_keyboard())
     elif command == "/mainnet_check":
         send_with_keyboard(telegram, mainnet_check_text(storage, private_client), build_trading_real_menu_keyboard())
+    elif command == "/real_orders":
+        send_with_keyboard(telegram, real_orders_text(storage), build_trading_real_menu_keyboard())
+    elif command == "/real_order_status":
+        target = args[0] if args else ""
+        if not target:
+            send_with_keyboard(telegram, "Использование: /real_order_status ORDER_ID", build_trading_real_menu_keyboard())
+        else:
+            send_with_keyboard(telegram, real_order_status_text(storage, target), build_trading_real_menu_keyboard())
+    elif command == "/cancel_real_order":
+        handle_cancel_real_order_request(storage, telegram, args)
     elif command == "/dry_run_order":
         send_with_keyboard(telegram, dry_run_order_text(storage, private_client, args), build_trading_real_menu_keyboard())
     elif command == "/enable_real":
@@ -567,6 +635,20 @@ def dispatch_command(
         handle_enable_testnet_trading(storage, telegram, private_client)
     elif command == "/safety_status":
         send_with_keyboard(telegram, safety_status_text(storage, private_client), build_trading_emergency_menu_keyboard())
+    elif command == "/cleanup_status":
+        send_with_keyboard(telegram, cleanup_status_text(storage), build_trading_cleanup_menu_keyboard())
+    elif command == "/cleanup_now":
+        send_with_keyboard(telegram, cleanup_now_text(storage, telegram), build_trading_cleanup_menu_keyboard())
+    elif command == "/cleanup_on":
+        storage.save_runtime_state("CLEANUP_ENABLED", True)
+        logging.getLogger("Cleanup").warning("Cleanup enabled")
+        send_with_keyboard(telegram, cleanup_status_text(storage), build_trading_cleanup_menu_keyboard())
+    elif command == "/cleanup_off":
+        storage.save_runtime_state("CLEANUP_ENABLED", False)
+        logging.getLogger("Cleanup").warning("Cleanup disabled")
+        send_with_keyboard(telegram, cleanup_status_text(storage), build_trading_cleanup_menu_keyboard())
+    elif command == "/set_cleanup_hours":
+        send_with_keyboard(telegram, set_cleanup_hours_text(storage, args), build_trading_cleanup_menu_keyboard())
     elif command == "/autopilot_status":
         send_with_keyboard(telegram, autopilot_status_text(storage, private_client), build_trading_autopilot_menu_keyboard())
     elif command == "/autopilot_on":
@@ -681,6 +763,8 @@ def handle_callback_query(
         edit_menu_message(telegram, message, "🚨 Emergency", build_trading_emergency_menu_keyboard())
     elif data == "menu:trading_autopilot":
         edit_menu_message(telegram, message, "🤖 Autopilot", build_trading_autopilot_menu_keyboard())
+    elif data == "menu:trading_cleanup":
+        edit_menu_message(telegram, message, "🧹 Cleanup", build_trading_cleanup_menu_keyboard())
     elif data == "menu:trading_real":
         edit_menu_message(telegram, message, "🐺 Real Gate", build_trading_real_menu_keyboard())
     elif data == "menu:backtest_help":
@@ -708,6 +792,9 @@ def handle_callback_query(
     elif data.startswith("order_testnet_confirm:"):
         plan_id = data.split(":", 1)[1]
         submit_testnet_order_after_confirmation(plan_id, storage, telegram, private_client)
+    elif data.startswith("order_real_step1:"):
+        plan_id = data.split(":", 1)[1]
+        handle_real_order_step1(plan_id, storage, telegram, private_client)
     elif data.startswith("order_real_confirm:"):
         plan_id = data.split(":", 1)[1]
         submit_real_order_after_confirmation(plan_id, storage, telegram, private_client)
@@ -733,6 +820,15 @@ def handle_callback_query(
         )
     elif data == "cancel_all_mainnet_cancel":
         send_with_keyboard(telegram, "❌ MAINNET cancel-all отменён.", build_trading_emergency_menu_keyboard())
+    elif data.startswith("cancel_real_confirm:"):
+        target = data.split(":", 1)[1]
+        send_with_keyboard(
+            telegram,
+            cancel_real_order_now(storage, private_client, target),
+            build_trading_real_menu_keyboard(),
+        )
+    elif data == "cancel_real_cancel":
+        send_with_keyboard(telegram, "❌ REAL cancel отменён.", build_trading_real_menu_keyboard())
     elif data == "api_set_cancel":
         storage.save_runtime_state("api_set_pending", False)
         edit_menu_message(telegram, message, "API setup cancelled.", build_trading_api_menu_keyboard())
@@ -1372,11 +1468,13 @@ def runtime_status_text(storage: Storage, private_client: BybitPrivateClient) ->
             f"Trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
             f"Source: {storage.runtime_setting_source('BYBIT_TRADING_ENABLED')}",
             f"Autopilot enabled: {str(storage.get_runtime_state('TESTNET_AUTOPILOT_ENABLED', config.TESTNET_AUTOPILOT_ENABLED)).lower()}",
+            f"TESTNET aggressive mode: {str(storage.get_runtime_state('TESTNET_AGGRESSIVE_MODE', config.TESTNET_AGGRESSIVE_MODE)).lower()}",
             f"Scan interval: {config.SCAN_INTERVAL_SECONDS}",
             f"Risk per trade: {config.ACCOUNT_RISK_PERCENT:g}%",
             f"Paper balance: {config.PAPER_ACCOUNT_BALANCE_USDT:g} USDT",
             f"Real trading unlocked: {str(real_trading_unlocked(storage)).lower()}",
             f"Effective real trading: {str(effective_real_trading(storage, private_client)).lower()}",
+            "Real autopilot: OFF",
             f"API status: {'OK' if api_ok else 'ERROR'}",
         ]
     )
@@ -1439,7 +1537,7 @@ def set_autopilot_enabled_text(
         storage.save_runtime_state("TESTNET_AUTOPILOT_ENABLED", False)
         return "⏸ TESTNET Autopilot disabled."
     if not private_client.testnet:
-        return "TESTNET Autopilot works only in TESTNET mode."
+        return "REAL autopilot is disabled in Phase 9.0."
     if not config.BYBIT_TRADING_ENABLED:
         return "❌ TESTNET Autopilot не включён: сначала /set_trading_enabled true."
     checks = run_private_api_checks(private_client)
@@ -1449,6 +1547,13 @@ def set_autopilot_enabled_text(
     storage.save_runtime_state("REAL_TRADING_UNLOCKED", False)
     logging.getLogger("RuntimeControl").warning("Runtime TESTNET_AUTOPILOT_ENABLED set to true")
     return "🧪 TESTNET Autopilot enabled.\nReal trading remains locked."
+
+
+def set_testnet_aggressive_text(storage: Storage, args: list[str]) -> str:
+    value = _parse_bool_arg(args)
+    if value is None:
+        return "Использование: /set_testnet_aggressive true|false"
+    return set_testnet_aggressive_mode_text(storage, value)
 
 
 def set_scan_interval_text(storage: Storage, args: list[str]) -> str:
@@ -1735,12 +1840,9 @@ def handle_autopilot_on(
     logger = logging.getLogger("TestnetAutopilot")
     if not private_client.testnet:
         logger.warning("Autopilot enable rejected: mode MAINNET")
-        if config.BYBIT_TRADING_ENABLED and not real_trading_unlocked(storage):
-            telegram.send_message(REAL_LOCK_PHRASE)
-            return
         send_with_keyboard(
             telegram,
-            "TESTNET Autopilot works only in TESTNET mode.",
+            "REAL autopilot is disabled in Phase 9.0.",
             build_trading_autopilot_menu_keyboard(),
         )
         return
@@ -1846,7 +1948,7 @@ def order_safety_block_reasons(
     reasons = []
     if storage.get_runtime_state("PANIC_MODE", False):
         reasons.append("PANIC_MODE=true")
-    if storage.get_runtime_state("RUNTIME_TRADING_DISABLED", False):
+    if config.BYBIT_TRADING_ENABLED and storage.get_runtime_state("RUNTIME_TRADING_DISABLED", False):
         reasons.append("runtime trading disabled")
     if storage.get_runtime_state("daily_loss_limit_reached", False):
         reasons.append("daily loss limit reached")
@@ -1897,6 +1999,7 @@ def safety_status_text(storage: Storage, private_client: BybitPrivateClient) -> 
         and private_client.has_api_keys
         and api_ok
     )
+    runtime_enabled = config.BYBIT_TRADING_ENABLED and not runtime_disabled
     allowed = not block_reasons
     reason = block_reasons[0] if block_reasons else "none"
     return "\n".join(
@@ -1905,19 +2008,23 @@ def safety_status_text(storage: Storage, private_client: BybitPrivateClient) -> 
             "",
             f"Panic mode: {'ON' if panic else 'OFF'}",
             f"Runtime trading disabled: {str(runtime_disabled).lower()}",
-            f"Real trading unlocked: {str(real_unlocked).lower()}",
-            f"BYBIT_TRADING_ENABLED env: {str(config.BYBIT_TRADING_ENABLED).lower()}",
             f"Mode: {mode}",
-            f"Execution mode: {execution_mode}",
+            f"Trading enabled: {str(config.BYBIT_TRADING_ENABLED).lower()}",
+            f"Runtime trading enabled: {str(runtime_enabled).lower()}",
+            f"Real trading unlocked: {str(real_unlocked).lower()}",
+            f"Effective real trading: {str(effective_real_trading(storage, private_client)).lower()}",
+            "Real autopilot: OFF",
+            f"TESTNET aggressive mode: {'ON' if storage.get_runtime_state('TESTNET_AGGRESSIVE_MODE', config.TESTNET_AGGRESSIVE_MODE) else 'OFF'}",
             f"Paper fallback: {'enabled' if paper_fallback else 'disabled'}",
-            f"API source: {private_client.credential_source}",
-            f"Testnet order capability: {'OK' if testnet_capability_ok else 'ERROR'}",
+            f"API status: {'OK' if api_ok else 'ERROR'}",
+            "Risk control: active",
+            f"Daily loss lock: {'yes' if daily_loss_lock else 'no'}",
             f"New orders allowed: {'yes' if allowed else 'no'}",
             f"Reason if blocked: {reason}",
             "",
-            "Risk control: active",
-            f"Daily loss lock: {'yes' if daily_loss_lock else 'no'}",
-            f"API status: {'OK' if api_ok else 'ERROR'}",
+            f"Execution mode: {execution_mode}",
+            f"API source: {private_client.credential_source}",
+            f"Testnet order capability: {'OK' if testnet_capability_ok else 'ERROR'}",
         ]
     )
 
@@ -1936,6 +2043,104 @@ def execution_mode_label(storage: Storage, private_client: BybitPrivateClient) -
     if effective_real_trading(storage, private_client):
         return "REAL"
     return "MAINNET_LOCKED"
+
+
+def cleanup_status_text(storage: Storage) -> str:
+    tracked = storage.database.count_bot_messages(include_deleted=True)
+    deleted = storage.database.count_deleted_bot_messages()
+    active = storage.get_bot_messages(include_deleted=False, limit=None)
+    protected = sum(1 for item in active if item.get("protected"))
+    last_ts = float(storage.get_runtime_state("last_cleanup_ts", 0) or 0)
+    last_text = datetime.fromtimestamp(last_ts, UTC).strftime("%Y-%m-%d %H:%M UTC") if last_ts else "never"
+    return "\n".join(
+        [
+            "🧹 Cleanup Status",
+            f"Cleanup: {'ON' if storage.get_runtime_state('CLEANUP_ENABLED', config.CLEANUP_ENABLED) else 'OFF'}",
+            f"Delete after: {float(storage.get_runtime_state('CLEANUP_DELETE_AFTER_HOURS', config.CLEANUP_DELETE_AFTER_HOURS)):g}h",
+            f"Tracked messages: {tracked}",
+            f"Deleted: {deleted}",
+            f"Protected active: {protected}",
+            f"Last cleanup: {last_text}",
+        ]
+    )
+
+
+def set_cleanup_hours_text(storage: Storage, args: list[str]) -> str:
+    value = _parse_float_arg(args)
+    if value is None or value < 1 or value > 46:
+        return "Использование: /set_cleanup_hours HOURS\nДиапазон: 1..46"
+    storage.save_runtime_state("CLEANUP_DELETE_AFTER_HOURS", value)
+    logging.getLogger("Cleanup").warning("Cleanup delete-after set to %.2fh", value)
+    return cleanup_status_text(storage)
+
+
+def cleanup_now_text(storage: Storage, telegram: TelegramClient) -> str:
+    summary = run_cleanup(storage, telegram, force=True)
+    return "\n".join(
+        [
+            "🧹 Cleanup completed",
+            f"Deleted: {summary['deleted']}",
+            f"Skipped: {summary['skipped']}",
+            f"Errors: {summary['errors']}",
+        ]
+    )
+
+
+def maybe_run_cleanup(storage: Storage, telegram: TelegramClient) -> None:
+    if not storage.get_runtime_state("CLEANUP_ENABLED", config.CLEANUP_ENABLED):
+        return
+    now_ts = time.time()
+    last_ts = float(storage.get_runtime_state("last_cleanup_ts", 0) or 0)
+    interval = max(0.1, float(config.CLEANUP_INTERVAL_HOURS)) * 3600
+    if now_ts - last_ts < interval:
+        return
+    run_cleanup(storage, telegram, force=False)
+
+
+def run_cleanup(storage: Storage, telegram: TelegramClient, force: bool = False) -> dict[str, int]:
+    logger = logging.getLogger("Cleanup")
+    delete_after_hours = float(storage.get_runtime_state("CLEANUP_DELETE_AFTER_HOURS", config.CLEANUP_DELETE_AFTER_HOURS))
+    now = datetime.now(UTC)
+    delete_after = timedelta(hours=delete_after_hours)
+    telegram_limit = timedelta(hours=47)
+    summary = {"deleted": 0, "skipped": 0, "errors": 0}
+    for message in storage.get_bot_messages(include_deleted=False, limit=None):
+        created_at = _parse_iso_datetime(message.get("created_at"))
+        if created_at is None:
+            summary["skipped"] += 1
+            continue
+        age = now - created_at
+        if message.get("protected"):
+            summary["skipped"] += 1
+            continue
+        if age < delete_after:
+            summary["skipped"] += 1
+            continue
+        if age > telegram_limit:
+            summary["skipped"] += 1
+            continue
+        try:
+            telegram.delete_message(message.get("chat_id"), message.get("message_id"))
+            storage.mark_bot_message_deleted(str(message.get("id")))
+            summary["deleted"] += 1
+        except Exception as exc:
+            logger.warning("Cleanup delete failed chat=%s message=%s error=%s", message.get("chat_id"), message.get("message_id"), exc)
+            summary["errors"] += 1
+    storage.save_runtime_state("last_cleanup_ts", time.time())
+    logger.info("Cleanup run force=%s deleted=%s skipped=%s errors=%s", force, summary["deleted"], summary["skipped"], summary["errors"])
+    return summary
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def real_gate_stats(storage: Storage) -> dict[str, Any]:
@@ -1994,8 +2199,10 @@ def real_order_safety_rejections(
         reasons.append("Bybit API keys не настроены.")
     if plan.get("risk_level") == "EXTREME":
         reasons.append("risk_level = EXTREME")
-    if plan.get("risk_level") == "HIGH" and not config.ALLOW_HIGH_RISK_ORDERS:
-        reasons.append("risk_level = HIGH, ALLOW_HIGH_RISK_ORDERS=false")
+    if plan.get("risk_level") == "HIGH":
+        reasons.append("risk_level = HIGH")
+    if plan.get("risk_level") not in {"LOW", "MEDIUM", None, ""}:
+        reasons.append("real mode allows LOW/MEDIUM only")
     if plan.get("execution_status") in {"TOO_LATE_DO_NOT_CHASE", "NO_SETUP"}:
         reasons.append("execution_status запрещён")
     if plan.get("setup_status") == "NO SETUP":
@@ -2084,6 +2291,63 @@ def format_testnet_confirmation(plan: dict[str, Any]) -> str:
             "Mode: TESTNET",
             "Real market: NO",
         ]
+    )
+
+
+def format_real_order_confirmation(plan: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "⚠️ REAL MARKET ORDER",
+            "",
+            f"Монета: {plan.get('symbol')}",
+            f"Направление: {_direction_ru(plan.get('side'))}",
+            f"Entry: {plan.get('entry_price')}",
+            f"Stop: {plan.get('stop_price')}",
+            f"TP1: {plan.get('tp1')}",
+            f"TP2: {plan.get('tp2')}",
+            f"Qty: {plan.get('qty')}",
+            f"Position size: {float(plan.get('position_size_usdt') or 0):.2f} USDT",
+            f"Risk: {float(plan.get('risk_usdt') or 0):.2f} USDT",
+            f"Fees: {plan.get('fee_mode')} | entry {float(plan.get('estimated_entry_fee') or 0):.4f} USDT",
+            f"Net R: TP1 {float(plan.get('net_r_tp1') or 0):.2f}R / TP2 {float(plan.get('net_r_tp2') or 0):.2f}R",
+            "",
+            "Это реальный рынок.",
+            "Деньги можно потерять.",
+        ]
+    )
+
+
+def handle_real_order_step1(
+    plan_id: str,
+    storage: Storage,
+    telegram: TelegramClient,
+    private_client: BybitPrivateClient,
+) -> None:
+    plan = storage.get_paper_order(plan_id)
+    if plan is None:
+        send_with_keyboard(telegram, "❌ План ордера не найден.", build_main_menu_keyboard())
+        return
+    if not (config.BYBIT_TRADING_ENABLED and not private_client.testnet and real_trading_unlocked(storage)):
+        telegram.send_message(REAL_LOCK_PHRASE)
+        return
+    reasons = real_order_safety_rejections(storage, private_client, plan)
+    if reasons:
+        send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {reasons[0]}", build_main_menu_keyboard())
+        return
+    telegram.send_message(
+        "\n".join(
+            [
+                "ПОСЛЕДНЕЕ ПОДТВЕРЖДЕНИЕ",
+                "",
+                "Отправить реальный лимитный ордер на Bybit?",
+            ]
+        ),
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "✅ Да, отправить REAL", "callback_data": f"order_real_confirm:{plan_id}"}],
+                [{"text": "❌ Нет", "callback_data": f"order_cancel:{plan_id}"}],
+            ]
+        },
     )
 
 
@@ -2299,10 +2563,10 @@ def submit_order_plan(
             send_with_keyboard(telegram, f"❌ Ордер отклонён\nПричина: {reasons[0]}", build_main_menu_keyboard())
             return
         telegram.send_message(
-            "⚠️ REAL MARKET MODE. Подтверди ещё раз.",
+            format_real_order_confirmation(plan),
             reply_markup={
                 "inline_keyboard": [
-                    [{"text": "⚠️ Да, отправить REAL ордер", "callback_data": f"order_real_confirm:{plan_id}"}],
+                    [{"text": "⚠️ Подтвердить REAL ордер", "callback_data": f"order_real_step1:{plan_id}"}],
                     [{"text": "❌ Отмена", "callback_data": f"order_cancel:{plan_id}"}],
                 ]
             },
@@ -2522,6 +2786,8 @@ def submit_real_order_after_confirmation(
             {
                 "status": "SUBMITTED",
                 "mode": "REAL",
+                "confirmations_passed": True,
+                "submitted_at": datetime.now(UTC).isoformat(),
                 "order_link_id": order_link_id,
                 "exchange_order_id": result.get("orderId"),
                 "raw_response_json": response,
@@ -2816,6 +3082,74 @@ def cancel_order_text(
         return f"❌ Не удалось отменить ордер: {sanitize_error(exc)}"
 
 
+def handle_cancel_real_order_request(
+    storage: Storage,
+    telegram: TelegramClient,
+    args: list[str],
+) -> None:
+    if not args:
+        send_with_keyboard(
+            telegram,
+            "Использование: /cancel_real_order ORDER_ID\nОтменяется только bot-owned REAL order и только после подтверждения.",
+            build_trading_real_menu_keyboard(),
+        )
+        return
+    target = args[0]
+    order = find_stored_order(storage, target)
+    if order is None or order.get("mode") != "REAL":
+        send_with_keyboard(telegram, "REAL order не найден.", build_trading_real_menu_keyboard())
+        return
+    telegram.send_message(
+        "\n".join(
+            [
+                "⚠️ Cancel REAL order?",
+                f"Symbol: {order.get('symbol')}",
+                f"Order ID: {order.get('exchange_order_id') or order.get('order_link_id') or order.get('id')}",
+            ]
+        ),
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "✅ Да, отменить REAL", "callback_data": f"cancel_real_confirm:{target}"}],
+                [{"text": "❌ Нет", "callback_data": "cancel_real_cancel"}],
+            ]
+        },
+    )
+
+
+def cancel_real_order_now(
+    storage: Storage,
+    private_client: BybitPrivateClient,
+    target: str,
+) -> str:
+    order = find_stored_order(storage, target)
+    if order is None or order.get("mode") != "REAL":
+        return "REAL order не найден."
+    if not real_trading_unlocked(storage):
+        return REAL_LOCK_PHRASE
+    if private_client.testnet:
+        return "❌ API mode TESTNET. REAL cancel не отправлен."
+    if mainnet_read_only_mode(storage):
+        return "❌ MAINNET read-only mode: cancel не отправлен."
+    try:
+        private_client.cancel_order(
+            symbol=str(order.get("symbol")),
+            order_id=str(order.get("exchange_order_id") or "") or None,
+            order_link_id=str(order.get("order_link_id") or "") or None,
+        )
+        storage.update_paper_order(
+            str(order.get("id")),
+            {
+                "status": "CANCELLED",
+                "cancelled_at": datetime.now(UTC).isoformat(),
+                "closed_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        logging.getLogger("ExecutionAssistant").warning("REAL order cancelled symbol=%s", order.get("symbol"))
+        return "✅ REAL order cancel request sent."
+    except Exception as exc:
+        return f"❌ REAL cancel failed: {sanitize_error(exc)}"
+
+
 def handle_cancel_all_testnet_request(
     storage: Storage,
     telegram: TelegramClient,
@@ -2934,7 +3268,8 @@ def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     orders = storage.get_paper_orders(limit=50)
     paper_orders = [order for order in orders if order.get("mode") in {None, "PAPER"}]
     testnet_orders = [order for order in orders if order.get("mode") == "TESTNET"]
-    if not paper_orders and not testnet_orders:
+    real_orders = [order for order in orders if order.get("mode") == "REAL"]
+    if not paper_orders and not testnet_orders and not real_orders:
         lines.append("Активных ордеров нет.")
 
     lines.extend(["", "Paper orders:"])
@@ -2960,6 +3295,20 @@ def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     else:
         lines.append("- нет")
 
+    lines.extend(["", "REAL orders:"])
+    if real_orders:
+        for index, order in enumerate(real_orders[:10], start=1):
+            lines.extend(
+                [
+                    f"{index}. {order.get('symbol')} | {_direction_ru(order.get('side'))} | {order.get('status')}",
+                    f"Entry: {order.get('entry_price')}",
+                    f"Qty: {order.get('qty')}",
+                    f"Order ID: {order.get('exchange_order_id') or order.get('order_link_id') or order.get('id')}",
+                ]
+            )
+    else:
+        lines.append("- none")
+
     lines.append("")
     lines.append("Bybit open orders:")
     if private_client.can_call_private:
@@ -2980,6 +3329,41 @@ def orders_text(storage: Storage, private_client: BybitPrivateClient) -> str:
     else:
         lines.append("- API credentials not configured")
     return "\n".join(lines)
+
+
+def real_orders_text(storage: Storage) -> str:
+    real_orders = [order for order in storage.get_paper_orders(limit=None) if order.get("mode") == "REAL"]
+    if not real_orders:
+        return "📋 REAL orders: none"
+    lines = ["📋 REAL orders"]
+    for index, order in enumerate(real_orders[:20], start=1):
+        lines.extend(
+            [
+                f"{index}. {order.get('symbol')} | {_direction_ru(order.get('side'))} | {order.get('status')}",
+                f"Entry: {order.get('entry_price')} | Qty: {order.get('qty')}",
+                f"Order ID: {order.get('exchange_order_id') or order.get('order_link_id') or order.get('id')}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def real_order_status_text(storage: Storage, target: str) -> str:
+    order = find_stored_order(storage, target)
+    if order is None or order.get("mode") != "REAL":
+        return "REAL order не найден."
+    return "\n".join(
+        [
+            "📋 REAL Order Status",
+            f"ID: {order.get('id')}",
+            f"Symbol: {order.get('symbol')}",
+            f"Side: {_direction_ru(order.get('side'))}",
+            f"Status: {order.get('status')}",
+            f"Entry: {order.get('entry_price')}",
+            f"Qty: {order.get('qty')}",
+            f"Exchange ID: {order.get('exchange_order_id') or 'n/a'}",
+            f"OrderLinkId: {order.get('order_link_id') or 'n/a'}",
+        ]
+    )
 
 
 def _format_local_order_line(order: dict[str, Any]) -> str:
@@ -3237,6 +3621,7 @@ async def main_async() -> None:
     bybit = BybitClient()
     private_client = BybitPrivateClient(storage)
     telegram = TelegramClient(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+    telegram.message_tracker = storage.add_bot_message
     scanner = MarketScanner(bybit, storage, telegram)
     autopilot = TestnetAutopilot(storage, private_client, telegram)
     scanner.autopilot_handler = autopilot.handle_alert
@@ -3295,6 +3680,7 @@ async def main_async() -> None:
 
             poll_telegram_commands(storage, telegram, scanner, private_client)
             maybe_sync_orders(storage, telegram, private_client)
+            maybe_run_cleanup(storage, telegram)
             await asyncio.sleep(1)
     finally:
         if health_server is not None:

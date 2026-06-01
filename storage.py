@@ -93,6 +93,9 @@ class Storage:
             "TESTNET_AGGRESSIVE_MODE": config.TESTNET_AGGRESSIVE_MODE,
             "PANIC_MODE": False,
             "RUNTIME_TRADING_DISABLED": False,
+            "CLEANUP_ENABLED": config.CLEANUP_ENABLED,
+            "CLEANUP_DELETE_AFTER_HOURS": config.CLEANUP_DELETE_AFTER_HOURS,
+            "last_cleanup_ts": 0,
             "api_set_pending": False,
             "last_setup_tracking_ts": 0,
         }
@@ -295,11 +298,40 @@ class Storage:
         self.state[key] = value
         self.database.save_runtime_state(key, value)
         self._apply_runtime_config_key(key, value)
+        self._mirror_runtime_setting(key, value)
 
     def get_runtime_state(self, key: str, default: Any = None) -> Any:
         if key in self.state:
             return self.state.get(key, default)
         return self.database.get_runtime_state(key, default)
+
+    def _mirror_runtime_setting(self, key: str, value: Any) -> None:
+        mapping = {
+            "BYBIT_TRADING_ENABLED": "trading_enabled",
+            "BYBIT_TESTNET": "testnet_mode",
+            "TESTNET_AUTOPILOT_ENABLED": "autopilot_enabled",
+            "TESTNET_AGGRESSIVE_MODE": "testnet_aggressive_mode",
+            "SCAN_INTERVAL_SECONDS": "scan_interval_seconds",
+            "TESTNET_AUTOPILOT_MAX_ACTIVE_ORDERS": "max_active_orders",
+            "ACCOUNT_RISK_PERCENT": "risk_percent",
+            "PAPER_ACCOUNT_BALANCE_USDT": "paper_balance",
+        }
+        column = mapping.get(key)
+        if column:
+            self.database.save_runtime_setting({column: value})
+
+    def add_bot_message(self, record: dict[str, Any]) -> dict[str, Any]:
+        return self.database.add_bot_message(record)
+
+    def get_bot_messages(
+        self,
+        include_deleted: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.database.get_bot_messages(include_deleted=include_deleted, limit=limit)
+
+    def mark_bot_message_deleted(self, record_id: str) -> None:
+        self.database.mark_bot_message_deleted(record_id)
 
     def get_fee_settings(self) -> dict[str, Any]:
         settings = self.database.get_fee_settings() or {}

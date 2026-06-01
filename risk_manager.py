@@ -13,6 +13,7 @@ def build_order_plan_from_alert(
     has_existing_order: bool = False,
     has_existing_position: bool = False,
     ignore_min_rr: bool = False,
+    allow_testnet_min_qty_adjust: bool = False,
 ) -> dict[str, Any]:
     setup = _setup_view(alert)
     symbol = str(alert.get("symbol") or "")
@@ -74,17 +75,42 @@ def build_order_plan_from_alert(
         return _reject(base_plan, "stop distance <= 0")
 
     position_size_usdt = risk_usdt / (stop_distance_percent / 100)
-    if position_size_usdt > config.MAX_POSITION_USDT:
+    if position_size_usdt > config.MAX_POSITION_USDT and not allow_testnet_min_qty_adjust:
         return _reject(base_plan, "position size выше лимита")
-    if position_size_usdt < config.MIN_POSITION_USDT:
+    if position_size_usdt < config.MIN_POSITION_USDT and not allow_testnet_min_qty_adjust:
         return _reject(base_plan, "position size ниже минимума")
 
-    qty = _round_qty(position_size_usdt / entry_price, instrument_info)
+    original_position_size_usdt = position_size_usdt
+    desired_qty = position_size_usdt / entry_price
+    qty = _round_qty(desired_qty, instrument_info)
+    original_qty = qty
     min_qty = _min_qty(instrument_info)
+    min_notional = _min_notional(instrument_info)
+    max_qty = _max_qty(instrument_info)
+    qty_adjusted = False
+    qty_adjust_reason: list[str] = []
+
+    if allow_testnet_min_qty_adjust:
+        required_qty = max(desired_qty, qty)
+        if min_qty is not None and required_qty < min_qty:
+            required_qty = min_qty
+            qty_adjust_reason.append("minOrderQty")
+        if min_notional is not None and required_qty * entry_price < min_notional:
+            required_qty = min_notional / entry_price
+            qty_adjust_reason.append("minNotionalValue")
+        adjusted_qty = _round_qty_up(required_qty, instrument_info)
+        if max_qty is not None and adjusted_qty > max_qty:
+            return _reject(base_plan, f"qty выше maxOrderQty ({max_qty:g})")
+        if adjusted_qty > qty:
+            qty = adjusted_qty
+            qty_adjusted = True
+
     if qty <= 0:
         return _reject(base_plan, "qty <= 0")
     if min_qty is not None and qty < min_qty:
         return _reject(base_plan, f"qty меньше minOrderQty ({min_qty:g})")
+    if min_notional is not None and qty * entry_price < min_notional:
+        return _reject(base_plan, f"notional меньше minNotionalValue ({min_notional:g})")
 
     position_size_usdt = qty * entry_price
     fee_mode = _fee_mode()
@@ -128,7 +154,16 @@ def build_order_plan_from_alert(
             "stop_distance_percent": stop_distance_percent,
             "position_size_usdt": position_size_usdt,
             "qty": qty,
+            "original_qty": original_qty,
+            "adjusted_qty": qty if qty_adjusted else original_qty,
+            "qty_adjusted": qty_adjusted,
+            "qty_adjust_reason": " / ".join(dict.fromkeys(qty_adjust_reason)),
+            "original_position_size_usdt": original_position_size_usdt,
+            "adjusted_position_size_usdt": position_size_usdt,
+            "min_qty": min_qty,
+            "min_notional": min_notional,
             "gross_risk_usdt": gross_risk_usdt,
+            "effective_risk_usdt": gross_risk_usdt,
             "gross_reward_tp1": gross_reward_tp1,
             "gross_reward_tp2": gross_reward_tp2,
             "fee_mode": fee_mode,
@@ -295,6 +330,14 @@ def _round_qty(qty: float, instrument_info: dict[str, Any]) -> float:
     return math.floor(qty / step) * step
 
 
+def _round_qty_up(qty: float, instrument_info: dict[str, Any]) -> float:
+    step = parse_price_value((instrument_info.get("lotSizeFilter") or {}).get("qtyStep"))
+    if step is None or step <= 0:
+        return qty
+    rounded = math.ceil(qty / step) * step
+    return round(rounded, _decimal_places(step))
+
+
 def _round_price(price: float, instrument_info: dict[str, Any]) -> float:
     tick = parse_price_value((instrument_info.get("priceFilter") or {}).get("tickSize"))
     if tick is None or tick <= 0:
@@ -304,6 +347,14 @@ def _round_price(price: float, instrument_info: dict[str, Any]) -> float:
 
 def _min_qty(instrument_info: dict[str, Any]) -> float | None:
     return parse_price_value((instrument_info.get("lotSizeFilter") or {}).get("minOrderQty"))
+
+
+def _max_qty(instrument_info: dict[str, Any]) -> float | None:
+    return parse_price_value((instrument_info.get("lotSizeFilter") or {}).get("maxOrderQty"))
+
+
+def _min_notional(instrument_info: dict[str, Any]) -> float | None:
+    return parse_price_value((instrument_info.get("lotSizeFilter") or {}).get("minNotionalValue"))
 
 
 def _decimal_places(value: float) -> int:

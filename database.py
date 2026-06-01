@@ -31,6 +31,22 @@ class BotDatabase:
             )
             self.connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS runtime_settings (
+                    id TEXT PRIMARY KEY,
+                    trading_enabled INTEGER,
+                    testnet_mode INTEGER,
+                    autopilot_enabled INTEGER,
+                    testnet_aggressive_mode INTEGER,
+                    scan_interval_seconds INTEGER,
+                    max_active_orders INTEGER,
+                    risk_percent REAL,
+                    paper_balance REAL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS alert_history (
                     id TEXT PRIMARY KEY,
                     timestamp TEXT,
@@ -168,13 +184,31 @@ class BotDatabase:
                     mode TEXT,
                     aggressive_mode INTEGER,
                     warnings_json TEXT,
+                    original_qty TEXT,
+                    adjusted_qty TEXT,
+                    min_qty TEXT,
+                    min_notional REAL,
                     raw_context_json TEXT,
                     data TEXT NOT NULL
                 )
                 """
             )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_messages (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT,
+                    message_id INTEGER,
+                    message_type TEXT,
+                    created_at TEXT NOT NULL,
+                    protected INTEGER NOT NULL DEFAULT 0,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
             self._ensure_autopilot_decision_columns()
             self._ensure_paper_order_columns()
+            self._ensure_bot_message_columns()
 
     def close(self) -> None:
         self.connection.close()
@@ -214,6 +248,7 @@ class BotDatabase:
             "raw_response_json": "TEXT",
             "last_error": "TEXT",
             "notes": "TEXT",
+            "confirmations_passed": "INTEGER",
         }
         for name, column_type in migrations.items():
             if name in columns:
@@ -222,6 +257,24 @@ class BotDatabase:
                 f"ALTER TABLE paper_orders ADD COLUMN {name} {column_type}"
             )
             self.logger.info("Added paper_orders.%s column", name)
+
+    def _ensure_bot_message_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(bot_messages)").fetchall()
+        }
+        migrations = {
+            "message_type": "TEXT",
+            "protected": "INTEGER NOT NULL DEFAULT 0",
+            "deleted": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, column_type in migrations.items():
+            if name in columns:
+                continue
+            self.connection.execute(
+                f"ALTER TABLE bot_messages ADD COLUMN {name} {column_type}"
+            )
+            self.logger.info("Added bot_messages.%s column", name)
 
     def get_runtime_state(self, key: str, default: Any = None) -> Any:
         row = self.connection.execute(
@@ -251,6 +304,70 @@ class BotDatabase:
                 """,
                 (key, self._dumps(value), self._now()),
             )
+
+    def save_runtime_setting(self, updates: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "trading_enabled",
+            "testnet_mode",
+            "autopilot_enabled",
+            "testnet_aggressive_mode",
+            "scan_interval_seconds",
+            "max_active_orders",
+            "risk_percent",
+            "paper_balance",
+        }
+        clean = {key: value for key, value in updates.items() if key in allowed}
+        if not clean:
+            return self.get_runtime_settings()
+
+        existing = self.get_runtime_settings()
+        existing.update(clean)
+        existing["updated_at"] = self._now()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO runtime_settings
+                    (id, trading_enabled, testnet_mode, autopilot_enabled,
+                     testnet_aggressive_mode, scan_interval_seconds, max_active_orders,
+                     risk_percent, paper_balance, updated_at)
+                VALUES ('active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    trading_enabled = excluded.trading_enabled,
+                    testnet_mode = excluded.testnet_mode,
+                    autopilot_enabled = excluded.autopilot_enabled,
+                    testnet_aggressive_mode = excluded.testnet_aggressive_mode,
+                    scan_interval_seconds = excluded.scan_interval_seconds,
+                    max_active_orders = excluded.max_active_orders,
+                    risk_percent = excluded.risk_percent,
+                    paper_balance = excluded.paper_balance,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    _bool_to_int(existing.get("trading_enabled")),
+                    _bool_to_int(existing.get("testnet_mode")),
+                    _bool_to_int(existing.get("autopilot_enabled")),
+                    _bool_to_int(existing.get("testnet_aggressive_mode")),
+                    existing.get("scan_interval_seconds"),
+                    existing.get("max_active_orders"),
+                    existing.get("risk_percent"),
+                    existing.get("paper_balance"),
+                    existing["updated_at"],
+                ),
+            )
+        return existing
+
+    def get_runtime_settings(self) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM runtime_settings WHERE id = 'active'"
+        ).fetchone()
+        if row is None:
+            return {}
+        record = dict(row)
+        for key in ("trading_enabled", "testnet_mode", "autopilot_enabled", "testnet_aggressive_mode"):
+            if record.get(key) is not None:
+                record[key] = bool(record[key])
+        record.pop("id", None)
+        return record
 
     def get_alert_history(self, limit: int | None = None) -> list[dict[str, Any]]:
         query = "SELECT data FROM alert_history ORDER BY rowid"
@@ -535,6 +652,10 @@ class BotDatabase:
             "raw_context_json": "TEXT",
             "aggressive_mode": "INTEGER",
             "warnings_json": "TEXT",
+            "original_qty": "TEXT",
+            "adjusted_qty": "TEXT",
+            "min_qty": "TEXT",
+            "min_notional": "REAL",
         }
         for name, column_type in migrations.items():
             if name in columns:
@@ -556,8 +677,9 @@ class BotDatabase:
                     (id, created_at, symbol, side, alert_type, risk_level,
                      execution_quality, setup_status, decision, reason, order_id,
                      order_link_id, setup_id, mode, aggressive_mode, warnings_json,
+                     original_qty, adjusted_qty, min_qty, min_notional,
                      raw_context_json, data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -576,6 +698,10 @@ class BotDatabase:
                     record.get("mode"),
                     1 if record.get("aggressive_mode") else 0,
                     self._dumps(record.get("warnings_json") or record.get("warnings") or []),
+                    record.get("original_qty"),
+                    record.get("adjusted_qty"),
+                    record.get("min_qty"),
+                    record.get("min_notional"),
                     self._dumps(record.get("raw_context_json") or record.get("raw_context") or {}),
                     self._dumps(record),
                 ),
@@ -597,6 +723,78 @@ class BotDatabase:
 
     def count_autopilot_decisions(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM autopilot_decisions").fetchone()[0])
+
+    def add_bot_message(self, record: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(record.get("chat_id") or "")
+        message_id = record.get("message_id")
+        if not chat_id or message_id is None:
+            return record
+        record_id = str(record.get("id") or f"msg_{chat_id}_{message_id}")
+        created_at = str(record.get("created_at") or self._now())
+        saved = {
+            "id": record_id,
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "message_type": str(record.get("message_type") or "message"),
+            "created_at": created_at,
+            "protected": bool(record.get("protected", False)),
+            "deleted": bool(record.get("deleted", False)),
+        }
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO bot_messages
+                    (id, chat_id, message_id, message_type, created_at, protected, deleted)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    saved["id"],
+                    saved["chat_id"],
+                    saved["message_id"],
+                    saved["message_type"],
+                    saved["created_at"],
+                    1 if saved["protected"] else 0,
+                    1 if saved["deleted"] else 0,
+                ),
+            )
+        return saved
+
+    def get_bot_messages(
+        self,
+        include_deleted: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM bot_messages"
+        params: list[Any] = []
+        if not include_deleted:
+            query += " WHERE deleted = 0"
+        query += " ORDER BY rowid"
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.connection.execute(query, tuple(params)).fetchall()
+        records = []
+        for row in rows:
+            record = dict(row)
+            record["protected"] = bool(record.get("protected"))
+            record["deleted"] = bool(record.get("deleted"))
+            records.append(record)
+        return records
+
+    def mark_bot_message_deleted(self, record_id: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE bot_messages SET deleted = 1 WHERE id = ?",
+                (record_id,),
+            )
+
+    def count_bot_messages(self, include_deleted: bool = True) -> int:
+        if include_deleted:
+            return int(self.connection.execute("SELECT COUNT(*) FROM bot_messages").fetchone()[0])
+        return int(self.connection.execute("SELECT COUNT(*) FROM bot_messages WHERE deleted = 0").fetchone()[0])
+
+    def count_deleted_bot_messages(self) -> int:
+        return int(self.connection.execute("SELECT COUNT(*) FROM bot_messages WHERE deleted = 1").fetchone()[0])
 
     def get_fee_settings(self) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -941,3 +1139,9 @@ class BotDatabase:
 
 def re_safe(value: str) -> str:
     return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+
+
+def _bool_to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return 1 if bool(value) else 0

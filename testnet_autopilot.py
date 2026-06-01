@@ -141,6 +141,17 @@ class TestnetAutopilot:
                 rr_warning = f"R/R below normal autopilot minimum: {plan_rr:.2f}R"
                 if rr_warning not in warnings:
                     warnings.append(rr_warning)
+            if aggressive and plan.get("qty_adjusted"):
+                adjustment_warning = (
+                    "⚠️ TESTNET qty auto-adjusted to Bybit minimum\n"
+                    f"Original qty: {plan.get('original_qty')}\n"
+                    f"Adjusted qty: {plan.get('adjusted_qty')}\n"
+                    f"Original position size: {float(plan.get('original_position_size_usdt') or 0):.4f} USDT\n"
+                    f"Adjusted position size: {float(plan.get('adjusted_position_size_usdt') or 0):.4f} USDT\n"
+                    f"Reason: {plan.get('qty_adjust_reason') or 'Bybit minimum'}\n"
+                    "Real market: NO"
+                )
+                warnings.append(adjustment_warning)
             plan["aggressive_mode"] = aggressive
             plan["warnings"] = warnings
             order_link_id = f"bobabot-auto-{uuid.uuid4().hex[:18]}"
@@ -265,6 +276,7 @@ class TestnetAutopilot:
             has_existing_order=False,
             has_existing_position=False,
             ignore_min_rr=aggressive,
+            allow_testnet_min_qty_adjust=aggressive,
         )
         if not plan.get("allowed"):
             reasons = plan.get("reasons") or ["risk validation rejected"]
@@ -317,6 +329,10 @@ class TestnetAutopilot:
             "rr_tp1": (plan or {}).get("rr_tp1"),
             "entry_price": (plan or {}).get("entry_price"),
             "qty": (plan or {}).get("qty"),
+            "original_qty": (plan or {}).get("original_qty"),
+            "adjusted_qty": (plan or {}).get("adjusted_qty"),
+            "min_qty": (plan or {}).get("min_qty"),
+            "min_notional": (plan or {}).get("min_notional"),
             "raw_context_json": alert_record,
         }
         return self.storage.add_autopilot_decision(record)
@@ -609,6 +625,7 @@ def autopilot_journal_text(storage: Any, limit: int = 10) -> str:
                 f"Execution: {item.get('execution_quality') or 'n/a'}",
                 f"Aggressive: {'ON' if item.get('aggressive_mode') else 'OFF'}",
                 f"Warnings: {format_warnings_inline(item)}",
+                f"Qty: {item.get('adjusted_qty') or item.get('original_qty') or 'n/a'}",
                 f"Reason: {item.get('reason') or 'n/a'}",
                 f"Time: {format_time(item.get('created_at'))}",
                 "",
@@ -654,6 +671,7 @@ def format_autopilot_sent_message(plan: dict[str, Any], decision: dict[str, Any]
         f"Side: {plan.get('side')}",
         f"Entry: {plan.get('entry_price')}",
         f"Qty: {plan.get('qty')}",
+        f"Position size: {float(plan.get('position_size_usdt') or 0):.2f} USDT",
         f"Risk: {plan.get('risk_usdt', 0):.2f} USDT",
         f"Reason: {decision.get('reason') or 'setup activated + autopilot passed'}",
         f"Order ID: {plan.get('exchange_order_id') or plan.get('order_link_id') or plan.get('id')}",
@@ -669,6 +687,7 @@ def format_autopilot_sent_message(plan: dict[str, Any], decision: dict[str, Any]
 
 
 def format_autopilot_rejected_message(setup: dict[str, Any], reason: str) -> str:
+    technical = "yes" if is_technical_rejection(reason) else "no"
     return "\n".join(
         [
             "❌ TESTNET AUTOPILOT REJECTED",
@@ -676,8 +695,21 @@ def format_autopilot_rejected_message(setup: dict[str, Any], reason: str) -> str
             f"Symbol: {setup.get('symbol', 'n/a')}",
             f"Side: {direction_from_bias(setup.get('setup_bias')) or setup.get('side') or 'n/a'}",
             f"Reason: {reason}",
+            f"Technical blocker: {technical}",
         ]
     )
+
+
+def is_technical_rejection(reason: str) -> bool:
+    text = str(reason or "")
+    non_technical_markers = (
+        "risk_level",
+        "execution_quality",
+        "execution_status",
+        "alert type not whitelisted",
+        "autopilot R/R below minimum",
+    )
+    return not any(marker in text for marker in non_technical_markers)
 
 
 def autopilot_debug_last_text(storage: Any, private_client: Any) -> str:
@@ -718,6 +750,10 @@ def autopilot_debug_last_text(storage: Any, private_client: Any) -> str:
             f"Paper mode: {str(not config.BYBIT_TRADING_ENABLED).lower()}",
             f"Risk OK: {str(risk_ok).lower()}",
             f"Duplicate order: {str(duplicate).lower()}",
+            f"Calculated qty: {decision.get('original_qty', 'n/a')}",
+            f"Bybit min qty: {decision.get('min_qty', 'n/a')}",
+            f"Min notional: {decision.get('min_notional', 'n/a')}",
+            f"Adjusted qty: {decision.get('adjusted_qty', 'n/a')}",
             f"Decision: {decision.get('decision', 'n/a')}",
             f"Reason: {decision.get('reason', 'n/a')}",
         ]

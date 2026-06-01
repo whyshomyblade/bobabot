@@ -103,7 +103,9 @@ def build_setups_trading_menu_keyboard() -> dict[str, Any]:
             [{"text": "⚙️ Runtime", "callback_data": "menu:trading_runtime"}],
             [{"text": "🚨 Emergency", "callback_data": "menu:trading_emergency"}],
             [{"text": "🤖 Autopilot", "callback_data": "menu:trading_autopilot"}],
+            [{"text": "🧹 Cleanup", "callback_data": "menu:trading_cleanup"}],
             [{"text": "🐺 Real Gate", "callback_data": "menu:trading_real"}],
+            [{"text": "🧩 Upgrade Status", "callback_data": "cmd:/upgrade_status"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
@@ -161,6 +163,8 @@ def build_trading_runtime_menu_keyboard() -> dict[str, Any]:
             [{"text": "🔒 Disable Trading", "callback_data": "cmd:/set_trading_enabled false"}],
             [{"text": "🤖 Enable Autopilot", "callback_data": "cmd:/set_autopilot_enabled true"}],
             [{"text": "⏸ Disable Autopilot", "callback_data": "cmd:/set_autopilot_enabled false"}],
+            [{"text": "🧪 Aggressive ON", "callback_data": "cmd:/set_testnet_aggressive true"}],
+            [{"text": "🧊 Aggressive OFF", "callback_data": "cmd:/set_testnet_aggressive false"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
@@ -215,12 +219,25 @@ def build_trading_real_menu_keyboard() -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [{"text": "🐺 Real Status", "callback_data": "cmd:/real_status"}],
-            [{"text": "🧪 Dry Run Status", "callback_data": "cmd:/dry_run_status"}],
-            [{"text": "🔍 Mainnet Check", "callback_data": "cmd:/mainnet_check"}],
-            [{"text": "🧮 Dry Run Order Help", "callback_data": "cmd:/dry_run_order help"}],
             [{"text": "🔓 Enable Real", "callback_data": "cmd:/enable_real"}],
             [{"text": "🔒 Disable Real", "callback_data": "cmd:/disable_real"}],
-            [{"text": "🚨 Panic", "callback_data": "cmd:/panic"}],
+            [{"text": "📋 Real Orders", "callback_data": "cmd:/real_orders"}],
+            [{"text": "🔍 Mainnet Check", "callback_data": "cmd:/mainnet_check"}],
+            [{"text": "❌ Cancel Real Order Help", "callback_data": "cmd:/cancel_real_order"}],
+            [{"text": "🧩 Upgrade Status", "callback_data": "cmd:/upgrade_status"}],
+            [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
+            [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
+        ]
+    }
+
+
+def build_trading_cleanup_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "🧹 Cleanup Status", "callback_data": "cmd:/cleanup_status"}],
+            [{"text": "🧹 Cleanup Now", "callback_data": "cmd:/cleanup_now"}],
+            [{"text": "✅ Cleanup ON", "callback_data": "cmd:/cleanup_on"}],
+            [{"text": "⛔ Cleanup OFF", "callback_data": "cmd:/cleanup_off"}],
             [{"text": "⬅️ Назад", "callback_data": "menu:setups_trading"}],
             [{"text": "❌ Закрыть меню", "callback_data": "menu:close"}],
         ]
@@ -307,6 +324,7 @@ class TelegramClient:
         self.session = requests.Session()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.last_send_ts = 0.0
+        self.message_tracker = None
 
     def _request(
         self,
@@ -384,7 +402,7 @@ class TelegramClient:
         text: str,
         reply_markup: dict[str, Any] | None = None,
         chat_id: Any | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         now = time.time()
         elapsed = now - self.last_send_ts
         if elapsed < config.TELEGRAM_MIN_SECONDS_BETWEEN_MESSAGES:
@@ -398,17 +416,19 @@ class TelegramClient:
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
 
-        self._request(
+        data = self._request(
             "sendMessage",
             payload,
         )
         self.last_send_ts = time.time()
+        self._track_sent_message(data, payload["chat_id"], "message", text)
+        return data
 
     def send_document(
         self,
         path: str | Path,
         caption: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         file_path = Path(path)
         url = f"{self.base_url}/sendDocument"
         payload = {"chat_id": self.chat_id}
@@ -429,13 +449,43 @@ class TelegramClient:
                 data = response.json()
                 if not data.get("ok"):
                     raise TelegramAPIError(data.get("description", "unknown error"))
-                return
+                self._track_sent_message(data, payload["chat_id"], "document", caption or file_path.name)
+                return data
             except (OSError, requests.RequestException, ValueError, TelegramAPIError) as exc:
                 last_error = exc
                 if attempt >= config.MAX_RETRIES:
                     break
                 time.sleep(config.RETRY_BACKOFF_SECONDS * attempt)
         raise TelegramAPIError(f"Telegram sendDocument failed after retries: {last_error}")
+
+    def _track_sent_message(
+        self,
+        response: dict[str, Any],
+        chat_id: Any,
+        message_type: str,
+        text: str,
+    ) -> None:
+        if self.message_tracker is None:
+            return
+        result = response.get("result") if isinstance(response, dict) else None
+        if not isinstance(result, dict):
+            return
+        message_id = result.get("message_id")
+        if message_id is None:
+            return
+        protected_keywords = ("SETUP", "СЕТАП", "ORDER", "ОРДЕР", "TP1", "TP2")
+        protected = any(keyword in str(text or "").upper() for keyword in protected_keywords)
+        try:
+            self.message_tracker(
+                {
+                    "chat_id": str(chat_id),
+                    "message_id": message_id,
+                    "message_type": message_type,
+                    "protected": protected,
+                }
+            )
+        except Exception as exc:
+            self.logger.warning("Could not track Telegram message: %s", exc)
 
     def edit_message_text(
         self,
